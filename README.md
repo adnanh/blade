@@ -6,6 +6,8 @@ Blade ("the runner") is a terminal UI for starting and supervising all the comma
 
 Blade is Linux/Unix-oriented and currently supports POSIX-compatible user shells such as zsh and bash.
 
+![Blade demo](demo.gif)
+
 ## Features
 
 - **Interactive TUI** -- start, stop, restart, and monitor commands in a terminal interface
