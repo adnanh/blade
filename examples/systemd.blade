@@ -1,0 +1,75 @@
+version = 1
+name = "Application with a systemd dependency"
+shell = "/bin/zsh"
+max_log_lines = 100000
+
+[[groups]]
+name = "Backend"
+
+[[groups.commands]]
+name = "RabbitMQ"
+pre = ['''
+if systemctl is-active --quiet rabbitmq.service; then
+  export BLADE_RABBITMQ_OWNED=0
+else
+  systemctl start rabbitmq.service
+  export BLADE_RABBITMQ_OWNED=1
+fi
+''']
+run = '''
+blade_rabbitmq_cleanup() {
+  trap - INT TERM EXIT
+  if [ "$BLADE_RABBITMQ_OWNED" = "1" ]; then
+    systemctl stop rabbitmq.service
+  fi
+}
+trap blade_rabbitmq_cleanup INT TERM EXIT
+
+blade_watch_systemd_unit() {
+  blade_unit="$1"
+  journalctl --follow --unit "$blade_unit" --lines=0 --output=cat &
+  blade_journal_pid=$!
+
+  while kill -0 "$blade_journal_pid" 2>/dev/null; do
+    blade_unit_state=$(systemctl show "$blade_unit" --property=ActiveState --value 2>/dev/null) || blade_unit_state=unknown
+    case "$blade_unit_state" in
+      active|activating|reloading|deactivating) sleep 0.5 ;;
+      inactive) blade_unit_status=0; break ;;
+      failed)
+        echo "$blade_unit entered the failed state"
+        blade_unit_status=1
+        break
+        ;;
+      *)
+        echo "could not determine the state of $blade_unit"
+        blade_unit_status=1
+        break
+        ;;
+    esac
+  done
+
+  if ! kill -0 "$blade_journal_pid" 2>/dev/null; then
+    wait "$blade_journal_pid"
+    blade_journal_status=$?
+    echo "journal follower for $blade_unit exited unexpectedly (status $blade_journal_status)"
+    blade_unit_status=1
+  else
+    kill "$blade_journal_pid" 2>/dev/null || true
+    wait "$blade_journal_pid" 2>/dev/null || true
+  fi
+  return "${blade_unit_status:-1}"
+}
+
+blade_watch_systemd_unit rabbitmq.service
+'''
+stop_timeout = 30
+
+[[groups.commands]]
+name = "Application"
+run = "./start-application"
+
+[[groups.commands.wait_for]]
+command = "RabbitMQ"
+kind = "delay"
+seconds = 0.1
+timeout = 60

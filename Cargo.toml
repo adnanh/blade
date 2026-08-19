@@ -1,0 +1,30 @@
+[package]
+name = "blade-runner"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Blade — the terminal project command runner"
+license = "MIT"
+
+[[bin]]
+name = "blade"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+nix = { version = "0.31", features = ["process", "signal", "term"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3.24"
+
+[profile.release]
+lto = "thin"
+strip = true

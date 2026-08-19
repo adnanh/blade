@@ -1,0 +1,83 @@
+version = 1
+name = "Example full-stack app"
+shell = "/bin/zsh"
+log_dir = ".blade-logs"
+log_rotate_bytes = 10485760
+log_rotate_keep = 5
+max_log_lines = 100000
+stop_timeout = 10
+
+[[groups]]
+name = "Backend"
+
+[[groups.commands]]
+name = "database"
+run = "docker compose up postgres"
+cwd = ".."
+autostart = true
+stop_timeout = 8
+
+[[groups.commands]]
+name = "api"
+shell_setup = ["export NODE_ENV=development"]
+pre = ["yarn install --frozen-lockfile"]
+run = "yarn dev:api"
+cwd = ".."
+autostart = true
+log_file = ".blade-logs/api.log"
+
+[[groups.commands.actions]]
+name = "Pull changes"
+run = "git pull --ff-only"
+
+[[groups.commands.actions]]
+name = "Install dependencies"
+run = "yarn install --frozen-lockfile"
+requires_stopped = true
+restart_after = "if-running"
+
+[[groups.commands.wait_for]]
+command = "database"
+kind = "keyword"
+value = "database system is ready to accept connections"
+case_sensitive = false
+timeout = 60
+
+[[groups.commands]]
+name = "worker"
+run = "yarn dev:worker"
+cwd = ".."
+
+[[groups.commands.wait_for]]
+command = "api"
+kind = "idle"
+seconds = 2
+timeout = 90
+
+[[groups]]
+name = "Frontend"
+
+[[groups.commands]]
+name = "dashboard"
+pre = ["yarn install --frozen-lockfile"]
+run = "yarn dev:dashboard"
+cwd = ".."
+autostart = true
+
+[[groups.commands.wait_for]]
+command = "api"
+kind = "keyword"
+value = "Listening on"
+timeout = 90
+
+[[groups.commands]]
+name = "storybook"
+run = "yarn storybook"
+cwd = ".."
+
+# Delay readiness is useful when a dependency has no stable readiness line:
+[[groups.commands.wait_for]]
+command = "dashboard"
+kind = "delay"
+seconds = 3
+timeout = 30
