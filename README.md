@@ -246,7 +246,7 @@ Quit applies the same graceful stop to every active command. Pressing quit again
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request at [github.com/anomalyco/blade](https://github.com/anomalyco/blade).
+Contributions are welcome! Please open an issue or submit a pull request at [github.com/adnanh/blade](https://github.com/adnanh/blade).
 
 ## License
 
