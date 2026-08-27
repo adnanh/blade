@@ -2,19 +2,33 @@ use std::{collections::VecDeque, sync::OnceLock};
 
 use chrono::{DateTime, Local};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogKind {
     Output,
     System,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogLine {
     pub sequence: u64,
     pub timestamp: DateTime<Local>,
     pub text: String,
     pub kind: LogKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogMetadata {
+    pub count: usize,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogUpdate {
+    pub metadata: LogMetadata,
+    pub lines: Vec<LogLine>,
 }
 
 impl LogLine {
@@ -79,6 +93,27 @@ impl LogBuffer {
         self.lines.iter().cloned().collect()
     }
 
+    pub fn metadata(&self) -> LogMetadata {
+        LogMetadata {
+            count: self.lines.len(),
+            first_sequence: self.lines.front().map(|line| line.sequence),
+            last_sequence: self.lines.back().map(|line| line.sequence),
+        }
+    }
+
+    pub fn update_since(&self, after: Option<u64>) -> LogUpdate {
+        let lines = self
+            .lines
+            .iter()
+            .filter(|line| after.is_none_or(|sequence| line.sequence > sequence))
+            .cloned()
+            .collect();
+        LogUpdate {
+            metadata: self.metadata(),
+            lines,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.lines.clear();
     }
@@ -128,5 +163,33 @@ mod tests {
         assert!(buffer.snapshot().is_empty());
         let second = buffer.push(LogKind::Output, "after");
         assert!(second.sequence > first.sequence);
+    }
+
+    #[test]
+    fn incremental_updates_include_only_new_lines_and_current_metadata() {
+        let mut buffer = LogBuffer::new(3);
+        let first = buffer.push(LogKind::Output, "one");
+        let second = buffer.push(LogKind::Output, "two");
+
+        let initial = buffer.update_since(None);
+        assert_eq!(initial.metadata.count, 2);
+        assert_eq!(initial.metadata.first_sequence, Some(first.sequence));
+        assert_eq!(initial.metadata.last_sequence, Some(second.sequence));
+        assert_eq!(initial.lines.len(), 2);
+
+        buffer.push(LogKind::Output, "three");
+        let fourth = buffer.push(LogKind::Output, "four");
+        let update = buffer.update_since(Some(second.sequence));
+        assert_eq!(update.metadata.count, 3);
+        assert_eq!(update.metadata.first_sequence, Some(second.sequence));
+        assert_eq!(update.metadata.last_sequence, Some(fourth.sequence));
+        assert_eq!(
+            update
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["three", "four"]
+        );
     }
 }

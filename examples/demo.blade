@@ -1,0 +1,79 @@
+version = 1
+name = "Northstar Development"
+shell = "/bin/sh"
+max_log_lines = 2000
+stop_timeout = 1
+
+[theme]
+preset = "tokyo-night"
+
+[[groups]]
+name = "Infrastructure"
+
+[[groups.commands]]
+name = "PostgreSQL"
+run = "exec sh ./demo-service.sh postgres"
+autostart = true
+
+[[groups.commands]]
+name = "Redis"
+run = "exec sh ./demo-service.sh redis"
+autostart = true
+
+[[groups]]
+name = "Backend"
+
+[[groups.commands]]
+name = "API"
+run = "exec sh ./demo-service.sh api"
+autostart = true
+
+[[groups.commands.wait_for]]
+command = "PostgreSQL"
+kind = "keyword"
+value = "ready to accept connections"
+timeout = 10
+
+[[groups.commands.actions]]
+name = "Git pull"
+run = "exec sh ./demo-service.sh git-pull"
+
+[[groups.commands]]
+name = "Worker"
+run = "exec sh ./demo-service.sh worker"
+autostart = true
+
+[[groups.commands.wait_for]]
+command = "API"
+kind = "keyword"
+value = "API listening"
+timeout = 10
+
+[[groups]]
+name = "Frontend"
+
+[[groups.commands]]
+name = "Dashboard"
+run = "exec sh ./demo-service.sh dashboard"
+autostart = true
+
+[[groups.commands.wait_for]]
+command = "API"
+kind = "keyword"
+value = "API listening"
+timeout = 10
+
+[[groups.commands.actions]]
+name = "Git pull"
+run = "exec sh ./demo-service.sh git-pull"
+
+[[groups.commands]]
+name = "Storybook"
+run = "exec sh ./demo-service.sh storybook"
+autostart = true
+
+[[groups.commands.wait_for]]
+command = "Dashboard"
+kind = "keyword"
+value = "VITE ready"
+timeout = 10

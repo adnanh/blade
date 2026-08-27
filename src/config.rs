@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::theme::{Theme, ThemeCatalog, ThemeOverrides, parse_color};
 
@@ -121,7 +121,7 @@ pub struct GroupConfig {
     pub commands: Vec<CommandConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandConfig {
     pub id: String,
     pub name: String,
@@ -143,7 +143,7 @@ pub struct CommandConfig {
     pub actions: Vec<ActionConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionConfig {
     pub id: String,
     pub parent_id: String,
@@ -192,21 +192,21 @@ impl ActionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RestartAfter {
     Never,
     IfRunning,
     Always,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaitCondition {
     pub command: String,
     pub readiness: Readiness,
     pub timeout: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Readiness {
     Keyword { value: String, case_sensitive: bool },
     Idle { seconds: f64 },

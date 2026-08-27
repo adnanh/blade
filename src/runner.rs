@@ -19,16 +19,17 @@ use nix::{
     sys::termios::Termios,
     unistd::Pid,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{
         ActionConfig, CommandConfig, ProjectConfig, Readiness, RestartAfter, WaitCondition,
         action_id,
     },
-    log_buffer::{LogBuffer, LogKind, LogLine, sanitize_terminal_text},
+    log_buffer::{LogBuffer, LogKind, LogLine, LogMetadata, LogUpdate, sanitize_terminal_text},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandState {
     Stopped,
     Waiting,
@@ -67,6 +68,7 @@ pub struct RuntimeSnapshot {
     pub exit_code: Option<i32>,
     pub stop_level: u8,
     pub stop_deadline: Option<Instant>,
+    pub log_metadata: Option<LogMetadata>,
 }
 
 #[derive(Clone)]
@@ -372,6 +374,15 @@ impl Runner {
             .count()
     }
 
+    pub fn command_configs(&self) -> Vec<CommandConfig> {
+        lock_inner(&self.shared)
+            .runtimes
+            .values()
+            .filter(|runtime| matches!(runtime.kind, RuntimeKind::Command))
+            .map(|runtime| (*runtime.config).clone())
+            .collect()
+    }
+
     pub fn add_command(&self, mut config: CommandConfig) -> Result<()> {
         let mut inner = lock_inner(&self.shared);
         if inner.runtimes.contains_key(&config.id) {
@@ -502,6 +513,7 @@ impl Runner {
             exit_code: runtime.exit_code,
             stop_level: runtime.stop_level,
             stop_deadline: runtime.stop_deadline,
+            log_metadata: Some(runtime.logs.metadata()),
         })
     }
 
@@ -512,6 +524,14 @@ impl Runner {
             .get(name)
             .map(|runtime| runtime.logs.snapshot())
             .unwrap_or_default()
+    }
+
+    pub fn log_update(&self, name: &str, after: Option<u64>) -> Option<LogUpdate> {
+        let inner = lock_inner(&self.shared);
+        inner
+            .runtimes
+            .get(name)
+            .map(|runtime| runtime.logs.update_since(after))
     }
 
     pub fn clear_logs(&self, name: &str) -> Result<()> {
@@ -1061,29 +1081,64 @@ fn record_output_bytes(
     let text = sanitize_terminal_text(text.trim_end_matches(['\r', '\n']));
     if text == sentinel {
         mark_running(shared, name, generation);
+    } else if let Some(index) = pre_step_index(&text, sentinel) {
+        log_pre_step(shared, name, generation, index);
     } else {
         record_output(shared, name, generation, text);
     }
 }
 
+fn pre_step_index(text: &str, sentinel: &str) -> Option<usize> {
+    text.strip_prefix(sentinel)?
+        .strip_prefix("PRE_")?
+        .strip_suffix("__")?
+        .parse()
+        .ok()
+}
+
+fn log_pre_step(shared: &Arc<Shared>, name: &str, generation: u64, index: usize) {
+    let message = {
+        let inner = lock_inner(shared);
+        let Some(runtime) = inner.runtimes.get(name) else {
+            return;
+        };
+        if runtime.generation != generation || !runtime.state.is_active() {
+            return;
+        }
+        let Some(step) = runtime.config.pre.get(index) else {
+            return;
+        };
+        format!(
+            "pre command: {step:?} (cwd: {})",
+            runtime.config.cwd.display()
+        )
+    };
+    emit(shared, name, LogKind::System, message);
+}
+
 fn mark_running(shared: &Arc<Shared>, name: &str, generation: u64) {
-    let changed = {
+    let command_message = {
         let mut inner = lock_inner(shared);
         let Some(runtime) = inner.runtimes.get_mut(name) else {
             return;
         };
         if runtime.generation != generation || runtime.state == CommandState::Stopping {
-            false
+            None
         } else {
             let now = Instant::now();
             runtime.state = CommandState::Running;
             runtime.running_since = Some(now);
             runtime.last_output_at = Some(now);
             shared.changed.notify_all();
-            true
+            Some(format!(
+                "command: {:?} (cwd: {})",
+                runtime.config.run,
+                runtime.config.cwd.display()
+            ))
         }
     };
-    if changed {
+    if let Some(command_message) = command_message {
+        emit(shared, name, LogKind::System, command_message);
         emit(shared, name, LogKind::System, "running".to_owned());
     }
 }
@@ -1452,18 +1507,30 @@ fn shell_script(config: &CommandConfig, sentinel: &str) -> String {
     // it keeps the shell and its command in Blade's process group, so a stop
     // signal still reaches the complete command tree.
     let mut script = String::from("set +m\nexec 2>&1\n");
-    for step in config.shell_setup.iter().chain(&config.pre) {
-        script.push_str(step);
-        script.push_str(
-            "\n__blade_status=$?\nif [ \"$__blade_status\" -ne 0 ]; then exit \"$__blade_status\"; fi\n",
-        );
+    for step in &config.shell_setup {
+        append_checked_step(&mut script, step);
     }
-    script.push_str("command printf '%s\\n' '");
-    script.push_str(sentinel);
-    script.push_str("'\n");
+    for (index, step) in config.pre.iter().enumerate() {
+        append_shell_marker(&mut script, &format!("{sentinel}PRE_{index}__"));
+        append_checked_step(&mut script, step);
+    }
+    append_shell_marker(&mut script, sentinel);
     script.push_str(&config.run);
     script.push('\n');
     script
+}
+
+fn append_checked_step(script: &mut String, step: &str) {
+    script.push_str(step);
+    script.push_str(
+        "\n__blade_status=$?\nif [ \"$__blade_status\" -ne 0 ]; then exit \"$__blade_status\"; fi\n",
+    );
+}
+
+fn append_shell_marker(script: &mut String, marker: &str) {
+    script.push_str("command printf '%s\\n' '");
+    script.push_str(marker);
+    script.push_str("'\n");
 }
 
 fn attach_pty(command: &mut Command) -> io::Result<File> {
@@ -1491,7 +1558,7 @@ fn attach_pty(command: &mut Command) -> io::Result<File> {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -1684,6 +1751,50 @@ run = "echo value=$BLADE_TEST_VALUE"
                 .logs("env")
                 .iter()
                 .any(|line| line.text == "value=preserved")
+        );
+    }
+
+    #[test]
+    fn logs_pre_and_main_commands_with_their_working_directory() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+name = "test"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "logged"
+pre = ["echo prepare-one", "echo prepare-two"]
+run = "echo main"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let cwd = project.command("logged").unwrap().cwd.display().to_string();
+        let runner = Runner::new(project);
+
+        runner.start("logged").unwrap();
+        wait_until_inactive(&runner, "logged");
+
+        let command_logs = runner
+            .logs("logged")
+            .into_iter()
+            .filter(|line| {
+                line.kind == LogKind::System
+                    && (line.text.starts_with("pre command:") || line.text.starts_with("command:"))
+            })
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command_logs,
+            [
+                format!("pre command: {:?} (cwd: {cwd})", "echo prepare-one"),
+                format!("pre command: {:?} (cwd: {cwd})", "echo prepare-two"),
+                format!("command: {:?} (cwd: {cwd})", "echo main"),
+            ]
         );
     }
 

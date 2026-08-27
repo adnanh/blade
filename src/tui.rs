@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -33,9 +34,10 @@ use crate::{
         ActionConfig, CommandConfig, GroupConfig, RestartAfter, action_id, set_project_theme_file,
         set_project_theme_preset, set_theme_preset, validate_file_for_combined_with_catalog,
     },
-    log_buffer::{LogKind, LogLine},
+    log_buffer::{LogKind, LogLine, LogMetadata, LogUpdate},
     project_list::ProjectEntry,
-    runner::{CommandState, Runner},
+    runner::{CommandState, RuntimeSnapshot},
+    supervisor::{EphemeralState, RunnerHandle},
     theme::{PRESETS, Theme, ThemeOverrides},
 };
 
@@ -52,6 +54,10 @@ enum Focus {
 enum CommandSelection {
     EphemeralGroup,
     Ephemeral(usize),
+    EphemeralAction {
+        ephemeral: usize,
+        action: usize,
+    },
     Project {
         first_group: usize,
     },
@@ -96,6 +102,7 @@ enum PersistField {
     Name,
     Project,
     Group,
+    Autostart,
 }
 
 struct PersistDialog {
@@ -103,8 +110,41 @@ struct PersistDialog {
     name: String,
     target: usize,
     group: String,
+    autostart: bool,
     field: PersistField,
     cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScratchField {
+    Name,
+    Run,
+    Cwd,
+    Pre,
+}
+
+struct ScratchDialog {
+    base: CommandConfig,
+    ephemeral_index: Option<usize>,
+    ephemeral_action: Option<usize>,
+    project: Option<String>,
+    suggested_group: String,
+    name: String,
+    run: String,
+    cwd: String,
+    pre: Vec<String>,
+    pre_index: usize,
+    field: ScratchField,
+    cursor: usize,
+    error: Option<String>,
+}
+
+struct ScratchContext {
+    base: CommandConfig,
+    ephemeral_index: Option<usize>,
+    ephemeral_action: Option<usize>,
+    project: Option<String>,
+    suggested_group: String,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +237,22 @@ struct ClipboardLease {
     active: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationAction {
+    Quit,
+    Start,
+    Stop,
+    Restart,
+    Detach,
+    RestartAndReattach,
+}
+
+struct ConfirmationDialog {
+    action: ConfirmationAction,
+    label: Option<String>,
+    target_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct EphemeralCommand {
     config: CommandConfig,
@@ -205,7 +261,7 @@ struct EphemeralCommand {
 }
 
 struct App {
-    runner: Runner,
+    runner: RunnerHandle,
     groups: Vec<GroupConfig>,
     project_catalog: Vec<ProjectTarget>,
     ephemeral: Vec<EphemeralCommand>,
@@ -215,6 +271,7 @@ struct App {
     theme_overrides: ThemeOverrides,
     theme_picker: Option<ThemePicker>,
     command_picker: Option<CommandPicker>,
+    scratchpad: Option<ScratchDialog>,
     persist_dialog: Option<PersistDialog>,
     manage: Option<ManageState>,
     command_items: Vec<CommandSelection>,
@@ -228,8 +285,9 @@ struct App {
     wrapped_log_end: usize,
     wrapped_cursor_at_top: bool,
     visible_log_range: Option<(usize, usize)>,
-    observed_log_count: usize,
-    observed_log_tail: Option<u64>,
+    log_cache_name: Option<String>,
+    log_cache_state: Option<CommandState>,
+    log_cache: Vec<LogLine>,
     horizontal_scroll: u16,
     search: Option<Regex>,
     search_source: String,
@@ -241,6 +299,8 @@ struct App {
     show_help: bool,
     log_view_height: usize,
     clipboard: Option<ClipboardLease>,
+    confirmation: Option<ConfirmationDialog>,
+    exit_action: RunOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +310,18 @@ pub enum StartupMode {
     None,
 }
 
-pub fn run(runner: Runner, startup: StartupMode) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Quit,
+    Detached,
+    Reload,
+}
+
+pub fn run(
+    runner: RunnerHandle,
+    startup: StartupMode,
+    initial_message: Option<String>,
+) -> Result<RunOutcome> {
     match startup {
         StartupMode::Configured => runner.autostart(),
         StartupMode::All => runner.start_all(),
@@ -259,8 +330,13 @@ pub fn run(runner: Runner, startup: StartupMode) -> Result<()> {
     let mut terminal = ratatui::try_init().context("could not initialize the terminal")?;
     let _restore = RestoreTerminal;
     let mut app = App::new(runner.clone());
+    if let Some(message) = initial_message {
+        app.message = message;
+    }
     let result = app.event_loop(&mut terminal);
-    runner.shutdown(true);
+    if result.is_err() && !runner.is_remote() {
+        runner.shutdown(true);
+    }
     result
 }
 
@@ -440,11 +516,27 @@ impl Drop for RestoreTerminal {
     }
 }
 
-fn build_command_items(groups: &[GroupConfig], ephemeral_count: usize) -> Vec<CommandSelection> {
+fn build_command_items(
+    groups: &[GroupConfig],
+    ephemeral: &[EphemeralCommand],
+) -> Vec<CommandSelection> {
     let mut items = Vec::new();
-    if ephemeral_count > 0 {
+    if !ephemeral.is_empty() {
         items.push(CommandSelection::EphemeralGroup);
-        items.extend((0..ephemeral_count).map(CommandSelection::Ephemeral));
+        for (ephemeral_index, ephemeral) in ephemeral.iter().enumerate() {
+            items.push(CommandSelection::Ephemeral(ephemeral_index));
+            items.extend(
+                ephemeral
+                    .config
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .map(|(action, _)| CommandSelection::EphemeralAction {
+                        ephemeral: ephemeral_index,
+                        action,
+                    }),
+            );
+        }
     }
     let mut previous_project = None;
     for (group_index, group) in groups.iter().enumerate() {
@@ -487,6 +579,15 @@ fn command_id_for_selection<'a>(
         CommandSelection::Ephemeral(index) => ephemeral
             .get(index)
             .map(|command| command.config.id.as_str()),
+        CommandSelection::EphemeralAction {
+            ephemeral: index,
+            action,
+        } => ephemeral
+            .get(index)?
+            .config
+            .actions
+            .get(action)
+            .map(|action| action.id.as_str()),
         CommandSelection::Command { group, command } => groups
             .get(group)?
             .commands
@@ -508,8 +609,35 @@ fn command_id_for_selection<'a>(
 }
 
 impl App {
-    fn new(runner: Runner) -> Self {
-        let groups = runner.project().groups.clone();
+    fn new(runner: impl Into<RunnerHandle>) -> Self {
+        let runner = runner.into();
+        let mut groups = runner.project().groups.clone();
+        for live in runner.configured_commands() {
+            if let Some(command) = groups
+                .iter_mut()
+                .filter(|group| group.project_file == live.project_file)
+                .flat_map(|group| group.commands.iter_mut())
+                .find(|command| command.name == live.name)
+            {
+                *command = live;
+            }
+        }
+        let ephemeral = runner
+            .ephemeral_commands()
+            .into_iter()
+            .map(|state| EphemeralCommand {
+                config: state.config,
+                project: state.project,
+                suggested_group: state.suggested_group,
+            })
+            .collect::<Vec<_>>();
+        let next_ephemeral_id = ephemeral
+            .iter()
+            .filter_map(|command| command.config.id.strip_prefix("__ephemeral::"))
+            .filter_map(|suffix| suffix.parse::<u64>().ok())
+            .max()
+            .unwrap_or_default()
+            + 1;
         let mut project_catalog = Vec::<ProjectTarget>::new();
         for group in &groups {
             let label = group
@@ -536,7 +664,7 @@ impl App {
                 group_names: Vec::new(),
             });
         }
-        let command_items = build_command_items(&groups, 0);
+        let command_items = build_command_items(&groups, &ephemeral);
         let selected_item = command_items
             .iter()
             .position(|item| matches!(item, CommandSelection::Command { .. }))
@@ -559,12 +687,13 @@ impl App {
             theme_overrides,
             theme_picker: None,
             command_picker: None,
+            scratchpad: None,
             persist_dialog: None,
             manage: None,
             groups,
             project_catalog,
-            ephemeral: Vec::new(),
-            next_ephemeral_id: 1,
+            ephemeral,
+            next_ephemeral_id,
             runner,
             command_items,
             selected_item,
@@ -577,25 +706,29 @@ impl App {
             wrapped_log_end: 0,
             wrapped_cursor_at_top: false,
             visible_log_range: None,
-            observed_log_count: 0,
-            observed_log_tail: None,
+            log_cache_name: None,
+            log_cache_state: None,
+            log_cache: Vec::new(),
             horizontal_scroll: 0,
             search: None,
             search_source: String::new(),
             search_kind: SearchKind::Exact,
             mode: InputMode::Normal,
-            message: "Ctrl-P opens Quick jump • : runs an ephemeral command • ? shows all keys"
-                .to_owned(),
+            message:
+                "Ctrl-P opens Quick jump • : runs an ephemeral command • ; forks/edits a scratchpad"
+                    .to_owned(),
             shutting_down: false,
             forced_quit_at: None,
             show_help: false,
             log_view_height: 1,
             clipboard: None,
+            confirmation: None,
+            exit_action: RunOutcome::Quit,
         }
     }
 
     fn rebuild_command_items(&mut self, selected_id: Option<&str>) {
-        self.command_items = build_command_items(&self.groups, self.ephemeral.len());
+        self.command_items = build_command_items(&self.groups, &self.ephemeral);
         if let Some(selected_id) = selected_id
             && let Some(index) = self.command_items.iter().position(|selection| {
                 command_id_for_selection(selection, &self.groups, &self.ephemeral)
@@ -610,17 +743,17 @@ impl App {
             .min(self.command_items.len().saturating_sub(1));
     }
 
-    fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<RunOutcome> {
         loop {
             self.refresh_clipboard();
             if self.shutting_down && self.runner.active_count() == 0 {
-                return Ok(());
+                return Ok(self.exit_action);
             }
             if self
                 .forced_quit_at
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                return Ok(());
+                return Ok(self.exit_action);
             }
             terminal.draw(|frame| self.draw(frame))?;
             if !event::poll(TICK_RATE)? {
@@ -629,7 +762,7 @@ impl App {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if self.handle_key(key)? {
-                        return Ok(());
+                        return Ok(self.exit_action);
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -642,12 +775,19 @@ impl App {
         if !matches!(self.mode, InputMode::Normal) {
             return self.handle_input_key(key);
         }
+        if self.confirmation.is_some() {
+            return self.handle_confirmation_key(key);
+        }
         if self.command_picker.is_some() {
             self.handle_command_picker_key(key);
             return Ok(false);
         }
         if self.theme_picker.is_some() {
             self.handle_theme_picker_key(key);
+            return Ok(false);
+        }
+        if self.scratchpad.is_some() {
+            self.handle_scratchpad_key(key);
             return Ok(false);
         }
         if self.manage.is_some() {
@@ -663,17 +803,21 @@ impl App {
             return Ok(false);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return self.request_quit();
+            self.open_confirmation(ConfirmationAction::Quit);
+            return Ok(false);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             self.open_command_picker();
             return Ok(false);
         }
         match key.code {
-            KeyCode::Char('q') => return self.request_quit(),
+            KeyCode::Char('Q') => self.open_confirmation(ConfirmationAction::Detach),
+            KeyCode::Char('R') => self.open_confirmation(ConfirmationAction::RestartAndReattach),
+            KeyCode::Char('q') => self.open_confirmation(ConfirmationAction::Quit),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('T') => self.open_theme_picker(),
             KeyCode::Char(':') => self.mode = InputMode::Ephemeral(String::new()),
+            KeyCode::Char(';') => self.open_scratchpad(),
             KeyCode::Char('p') => self.open_persist_dialog(),
             KeyCode::Char('M') => self.open_manage(),
             KeyCode::Char('D') => self.forget_ephemeral(),
@@ -726,10 +870,12 @@ impl App {
             KeyCode::Char('l') if self.focus == Focus::Logs && !self.wrap_logs => {
                 self.horizontal_scroll = self.horizontal_scroll.saturating_add(4)
             }
-            KeyCode::Enter | KeyCode::Char('s') => self.start_selected(),
+            KeyCode::Enter | KeyCode::Char('s') => {
+                self.open_confirmation(ConfirmationAction::Start)
+            }
             KeyCode::Char('f') => self.force_start_selected(),
-            KeyCode::Char('x') => self.stop_selected(),
-            KeyCode::Char('r') => self.restart_selected(),
+            KeyCode::Char('x') => self.open_confirmation(ConfirmationAction::Stop),
+            KeyCode::Char('r') => self.open_confirmation(ConfirmationAction::Restart),
             KeyCode::Char('t') => {
                 self.timestamps = !self.timestamps;
                 self.message = format!(
@@ -778,6 +924,64 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn open_confirmation(&mut self, action: ConfirmationAction) {
+        let (label, target_count) = match action {
+            ConfirmationAction::Start | ConfirmationAction::Stop | ConfirmationAction::Restart => {
+                let Some((label, names)) = self.selected_targets() else {
+                    return;
+                };
+                (Some(label), names.len())
+            }
+            ConfirmationAction::Quit
+            | ConfirmationAction::Detach
+            | ConfirmationAction::RestartAndReattach => (None, 0),
+        };
+        self.confirmation = Some(ConfirmationDialog {
+            action,
+            label,
+            target_count,
+        });
+    }
+
+    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let Some(dialog) = self.confirmation.take() else {
+                    return Ok(false);
+                };
+                match dialog.action {
+                    ConfirmationAction::Quit => self.request_quit(),
+                    ConfirmationAction::Detach => {
+                        self.exit_action = RunOutcome::Detached;
+                        Ok(true)
+                    }
+                    ConfirmationAction::RestartAndReattach => {
+                        self.exit_action = RunOutcome::Reload;
+                        Ok(true)
+                    }
+                    ConfirmationAction::Start => {
+                        self.start_selected();
+                        Ok(false)
+                    }
+                    ConfirmationAction::Stop => {
+                        self.stop_selected();
+                        Ok(false)
+                    }
+                    ConfirmationAction::Restart => {
+                        self.restart_selected();
+                        Ok(false)
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.confirmation = None;
+                self.message = "action cancelled".to_owned();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -832,8 +1036,9 @@ impl App {
         } else {
             self.shutting_down = true;
             self.runner.shutdown(false);
-            self.message =
-                format!("gracefully stopping {active} command(s); press q again to force quit");
+            self.message = format!(
+                "gracefully stopping {active} command(s); press q again and confirm to force quit"
+            );
         }
         Ok(false)
     }
@@ -851,6 +1056,9 @@ impl App {
             CommandSelection::Ephemeral(index) => {
                 self.ephemeral.get(index).map(|command| &command.config)
             }
+            CommandSelection::EphemeralAction { ephemeral, .. } => {
+                self.ephemeral.get(ephemeral).map(|command| &command.config)
+            }
             CommandSelection::Command { group, command }
             | CommandSelection::Action { group, command, .. } => {
                 self.groups.get(group)?.commands.get(command)
@@ -860,20 +1068,23 @@ impl App {
     }
 
     fn selected_action(&self) -> Option<&ActionConfig> {
-        let CommandSelection::Action {
-            group,
-            command,
-            action,
-        } = *self.command_items.get(self.selected_item)?
-        else {
-            return None;
-        };
-        self.groups
-            .get(group)?
-            .commands
-            .get(command)?
-            .actions
-            .get(action)
+        match *self.command_items.get(self.selected_item)? {
+            CommandSelection::EphemeralAction { ephemeral, action } => {
+                self.ephemeral.get(ephemeral)?.config.actions.get(action)
+            }
+            CommandSelection::Action {
+                group,
+                command,
+                action,
+            } => self
+                .groups
+                .get(group)?
+                .commands
+                .get(command)?
+                .actions
+                .get(action),
+            _ => None,
+        }
     }
 
     fn selected_runnable_label(&self) -> Option<&str> {
@@ -965,8 +1176,9 @@ impl App {
         self.wrapped_log_end = 0;
         self.wrapped_cursor_at_top = false;
         self.visible_log_range = None;
-        self.observed_log_count = 0;
-        self.observed_log_tail = None;
+        self.log_cache_name = None;
+        self.log_cache_state = None;
+        self.log_cache.clear();
         self.horizontal_scroll = 0;
         if search_was_active {
             self.message = "search cleared after changing selection".to_owned();
@@ -1085,6 +1297,14 @@ impl App {
                         let command = &self.ephemeral.get(index)?.config;
                         (command.name.as_str(), format!("Ephemeral {}", command.name))
                     }
+                    CommandSelection::EphemeralAction { ephemeral, action } => {
+                        let command = &self.ephemeral.get(ephemeral)?.config;
+                        let action = command.actions.get(action)?;
+                        (
+                            action.name.as_str(),
+                            format!("Ephemeral {} {}", command.name, action.name),
+                        )
+                    }
                     CommandSelection::Command { group, command } => {
                         let group_config = &self.groups[group];
                         let command_config = &group_config.commands[command];
@@ -1147,6 +1367,11 @@ impl App {
                 "Ephemeral / {}",
                 self.ephemeral.get(index)?.config.name
             )),
+            CommandSelection::EphemeralAction { ephemeral, action } => {
+                let command = &self.ephemeral.get(ephemeral)?.config;
+                let action = command.actions.get(action)?;
+                Some(format!("Ephemeral / {} › {}", command.name, action.name))
+            }
             CommandSelection::Command { group, command } => {
                 let group = self.groups.get(group)?;
                 let command = group.commands.get(command)?;
@@ -1271,10 +1496,14 @@ impl App {
     }
 
     fn move_log_cursor(&mut self, amount: isize) {
-        let count = self
-            .selected_command_name()
-            .map(|name| self.runner.logs(name).len())
-            .unwrap_or_default();
+        let Some(name) = self.selected_command_name().map(str::to_owned) else {
+            return;
+        };
+        let count = if self.log_cache_name.as_deref() == Some(name.as_str()) {
+            self.log_cache.len()
+        } else {
+            self.runner.logs(&name).len()
+        };
         if count == 0 {
             return;
         }
@@ -1356,6 +1585,398 @@ impl App {
         }
     }
 
+    fn open_scratchpad(&mut self) {
+        let Some(context) = self.scratchpad_context() else {
+            self.message =
+                "select a command, action, or ephemeral command to fork into a scratchpad"
+                    .to_owned();
+            return;
+        };
+        let ScratchContext {
+            base,
+            ephemeral_index,
+            ephemeral_action,
+            project,
+            suggested_group,
+        } = context;
+        let cwd = editable_cwd(&base);
+        let run = base.run.clone();
+        let name = base.name.clone();
+        let pre = if base.pre.is_empty() {
+            vec![String::new()]
+        } else {
+            base.pre.clone()
+        };
+        self.scratchpad = Some(ScratchDialog {
+            base,
+            ephemeral_index,
+            ephemeral_action,
+            project,
+            suggested_group,
+            cursor: name.chars().count(),
+            name,
+            run,
+            cwd,
+            pre,
+            pre_index: 0,
+            field: ScratchField::Name,
+            error: None,
+        });
+    }
+
+    fn scratchpad_context(&self) -> Option<ScratchContext> {
+        match *self.command_items.get(self.selected_item)? {
+            CommandSelection::Ephemeral(index) => {
+                let ephemeral = self.ephemeral.get(index)?;
+                Some(ScratchContext {
+                    base: ephemeral.config.clone(),
+                    ephemeral_index: Some(index),
+                    ephemeral_action: None,
+                    project: ephemeral.project.clone(),
+                    suggested_group: ephemeral.suggested_group.clone(),
+                })
+            }
+            CommandSelection::EphemeralAction { ephemeral, action } => {
+                let ephemeral_command = self.ephemeral.get(ephemeral)?;
+                let action_config = ephemeral_command.config.actions.get(action)?;
+                let mut base = action_config.runtime_config();
+                base.name.clone_from(&action_config.name);
+                Some(ScratchContext {
+                    base,
+                    ephemeral_index: Some(ephemeral),
+                    ephemeral_action: Some(action),
+                    project: ephemeral_command.project.clone(),
+                    suggested_group: ephemeral_command.suggested_group.clone(),
+                })
+            }
+            CommandSelection::Command { group, command } => {
+                let group = self.groups.get(group)?;
+                Some(ScratchContext {
+                    base: group.commands.get(command)?.clone(),
+                    ephemeral_index: None,
+                    ephemeral_action: None,
+                    project: group.project.clone(),
+                    suggested_group: group.name.clone(),
+                })
+            }
+            CommandSelection::Action {
+                group,
+                command,
+                action,
+            } => {
+                let group = self.groups.get(group)?;
+                let action = group.commands.get(command)?.actions.get(action)?;
+                let mut base = action.runtime_config();
+                base.name.clone_from(&action.name);
+                Some(ScratchContext {
+                    base,
+                    ephemeral_index: None,
+                    ephemeral_action: None,
+                    project: group.project.clone(),
+                    suggested_group: group.name.clone(),
+                })
+            }
+            CommandSelection::EphemeralGroup
+            | CommandSelection::Project { .. }
+            | CommandSelection::Group(_) => None,
+        }
+    }
+
+    fn handle_scratchpad_key(&mut self, key: KeyEvent) {
+        if self
+            .scratchpad
+            .as_ref()
+            .is_some_and(|dialog| dialog.error.is_some())
+        {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+                && let Some(dialog) = self.scratchpad.as_mut()
+            {
+                dialog.error = None;
+            }
+            return;
+        }
+        let Some(mut dialog) = self.scratchpad.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.message = "scratchpad cancelled".to_owned();
+                return;
+            }
+            KeyCode::Enter => match self.run_scratchpad(&dialog) {
+                Ok(()) => return,
+                Err(error) => {
+                    if dialog.name.trim().is_empty() {
+                        dialog.field = ScratchField::Name;
+                    } else if dialog.run.trim().is_empty() {
+                        dialog.field = ScratchField::Run;
+                    }
+                    dialog.cursor = scratch_field_text_len(&dialog);
+                    dialog.error = Some(format!("{error:#}"));
+                }
+            },
+            KeyCode::Tab | KeyCode::Down => {
+                dialog.field = next_scratch_field(dialog.field, false);
+                dialog.cursor = scratch_field_text_len(&dialog);
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                dialog.field = next_scratch_field(dialog.field, true);
+                dialog.cursor = scratch_field_text_len(&dialog);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.pre_index += 1;
+                dialog.pre.insert(dialog.pre_index, String::new());
+                dialog.field = ScratchField::Pre;
+                dialog.cursor = 0;
+            }
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && dialog.field == ScratchField::Pre =>
+            {
+                if dialog.pre.len() == 1 {
+                    dialog.pre[0].clear();
+                    dialog.cursor = 0;
+                } else {
+                    dialog.pre.remove(dialog.pre_index);
+                    dialog.pre_index = dialog.pre_index.min(dialog.pre.len() - 1);
+                    dialog.cursor = dialog.pre[dialog.pre_index].chars().count();
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if dialog.field == ScratchField::Pre
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                dialog.pre_index = if key.code == KeyCode::Left {
+                    dialog
+                        .pre_index
+                        .checked_sub(1)
+                        .unwrap_or(dialog.pre.len() - 1)
+                } else {
+                    (dialog.pre_index + 1) % dialog.pre.len()
+                };
+                dialog.cursor = dialog.pre[dialog.pre_index].chars().count();
+            }
+            KeyCode::Left | KeyCode::Right
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let length = scratch_field_text_len(&dialog);
+                move_text_cursor_with_len(&mut dialog.cursor, length, key.code == KeyCode::Right);
+            }
+            KeyCode::Home => dialog.cursor = 0,
+            KeyCode::End => dialog.cursor = scratch_field_text_len(&dialog),
+            KeyCode::Backspace => match dialog.field {
+                ScratchField::Name => remove_before_cursor(&mut dialog.name, &mut dialog.cursor),
+                ScratchField::Run => remove_before_cursor(&mut dialog.run, &mut dialog.cursor),
+                ScratchField::Cwd => remove_before_cursor(&mut dialog.cwd, &mut dialog.cursor),
+                ScratchField::Pre => {
+                    remove_before_cursor(&mut dialog.pre[dialog.pre_index], &mut dialog.cursor)
+                }
+            },
+            KeyCode::Delete => match dialog.field {
+                ScratchField::Name => remove_at_cursor(&mut dialog.name, dialog.cursor),
+                ScratchField::Run => remove_at_cursor(&mut dialog.run, dialog.cursor),
+                ScratchField::Cwd => remove_at_cursor(&mut dialog.cwd, dialog.cursor),
+                ScratchField::Pre => {
+                    remove_at_cursor(&mut dialog.pre[dialog.pre_index], dialog.cursor)
+                }
+            },
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match dialog.field {
+                    ScratchField::Name => {
+                        insert_at_cursor(&mut dialog.name, &mut dialog.cursor, character)
+                    }
+                    ScratchField::Run => {
+                        insert_at_cursor(&mut dialog.run, &mut dialog.cursor, character)
+                    }
+                    ScratchField::Cwd => {
+                        insert_at_cursor(&mut dialog.cwd, &mut dialog.cursor, character)
+                    }
+                    ScratchField::Pre => insert_at_cursor(
+                        &mut dialog.pre[dialog.pre_index],
+                        &mut dialog.cursor,
+                        character,
+                    ),
+                }
+            }
+            _ => {}
+        }
+        self.scratchpad = Some(dialog);
+    }
+
+    fn run_scratchpad(&mut self, dialog: &ScratchDialog) -> Result<()> {
+        let name = dialog.name.trim();
+        if name.is_empty() {
+            bail!("name must not be empty");
+        }
+        let run = dialog.run.trim();
+        if run.is_empty() {
+            bail!("run command must not be empty");
+        }
+        let cwd = resolve_scratch_cwd(&dialog.base.project_root, dialog.cwd.trim());
+        if !cwd.is_dir() {
+            bail!("working directory {} does not exist", cwd.display());
+        }
+        if dialog.ephemeral_action.is_some() {
+            return self.run_ephemeral_action_scratchpad(dialog, name, run, cwd);
+        }
+        let id = if let Some(index) = dialog.ephemeral_index {
+            let ephemeral = self
+                .ephemeral
+                .get(index)
+                .context("ephemeral command is no longer available")?;
+            if self
+                .runner
+                .snapshot(&ephemeral.config.id)
+                .is_some_and(|snapshot| snapshot.state.is_active())
+            {
+                bail!("stop the ephemeral command before editing it");
+            }
+            ephemeral.config.id.clone()
+        } else {
+            let id = format!("__ephemeral::{}", self.next_ephemeral_id);
+            self.next_ephemeral_id += 1;
+            id
+        };
+        let mut config = dialog.base.clone();
+        let source_cwd = config.cwd.clone();
+        config.id = id.clone();
+        config.name = name.to_owned();
+        config.run = run.to_owned();
+        config.cwd = cwd.clone();
+        config.pre = dialog
+            .pre
+            .iter()
+            .filter(|step| !step.trim().is_empty())
+            .cloned()
+            .collect();
+        config.wait_for.clear();
+        config.autostart = false;
+        config.log_dir = None;
+        config.log_file = None;
+        config.log_rotate_bytes = None;
+        for action in &mut config.actions {
+            if action.cwd == source_cwd {
+                action.cwd.clone_from(&cwd);
+            }
+            action.parent_id.clone_from(&id);
+            action.id = action_id(&id, &action.name);
+            action.log_dir = None;
+            action.log_file = None;
+            action.log_rotate_bytes = None;
+        }
+        if let Some(index) = dialog.ephemeral_index {
+            self.runner.update_command(config.clone())?;
+            let ephemeral = self
+                .ephemeral
+                .get_mut(index)
+                .context("ephemeral command is no longer available")?;
+            ephemeral.config = config;
+        } else {
+            self.runner.add_ephemeral(EphemeralState {
+                config: config.clone(),
+                project: dialog.project.clone(),
+                suggested_group: dialog.suggested_group.clone(),
+            })?;
+            self.ephemeral.push(EphemeralCommand {
+                config,
+                project: dialog.project.clone(),
+                suggested_group: dialog.suggested_group.clone(),
+            });
+        }
+        self.rebuild_command_items(Some(&id));
+        self.reset_log_navigation();
+        self.focus = Focus::Commands;
+        match self.runner.start(&id) {
+            Ok(()) if dialog.ephemeral_index.is_some() => {
+                self.message = "ephemeral command updated and started".to_owned()
+            }
+            Ok(()) => self.message = "scratchpad fork started".to_owned(),
+            Err(error) if dialog.ephemeral_index.is_some() => {
+                self.message = format!("ephemeral command updated but not started: {error:#}")
+            }
+            Err(error) => self.message = format!("scratchpad created but not started: {error:#}"),
+        }
+        Ok(())
+    }
+
+    fn run_ephemeral_action_scratchpad(
+        &mut self,
+        dialog: &ScratchDialog,
+        name: &str,
+        run: &str,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        let ephemeral_index = dialog
+            .ephemeral_index
+            .context("ephemeral command is no longer available")?;
+        let action_index = dialog
+            .ephemeral_action
+            .context("ephemeral action is no longer available")?;
+        let mut config = self
+            .ephemeral
+            .get(ephemeral_index)
+            .context("ephemeral command is no longer available")?
+            .config
+            .clone();
+        if config
+            .actions
+            .iter()
+            .enumerate()
+            .any(|(index, action)| index != action_index && action.name == name)
+        {
+            bail!("sub-command {name:?} already exists in this scratchpad");
+        }
+        let parent_id = config.id.clone();
+        let action = config
+            .actions
+            .get_mut(action_index)
+            .context("ephemeral action is no longer available")?;
+        let old_id = action.id.clone();
+        if self
+            .runner
+            .snapshot(&old_id)
+            .is_some_and(|snapshot| snapshot.state.is_active())
+        {
+            bail!("stop the ephemeral sub-command before editing it");
+        }
+        action.name = name.to_owned();
+        action.id = action_id(&parent_id, name);
+        action.parent_id = parent_id;
+        action.run = run.to_owned();
+        action.cwd = cwd;
+        action.pre = dialog
+            .pre
+            .iter()
+            .filter(|step| !step.trim().is_empty())
+            .cloned()
+            .collect();
+        action.log_dir = None;
+        action.log_file = None;
+        action.log_rotate_bytes = None;
+        let id = action.id.clone();
+        self.runner.update_command(config.clone())?;
+        self.ephemeral
+            .get_mut(ephemeral_index)
+            .context("ephemeral command is no longer available")?
+            .config = config;
+        self.rebuild_command_items(Some(&id));
+        self.reset_log_navigation();
+        self.focus = Focus::Commands;
+        match self.runner.start(&id) {
+            Ok(()) => self.message = "ephemeral sub-command updated and started".to_owned(),
+            Err(error) => {
+                self.message = format!("ephemeral sub-command updated but not started: {error:#}")
+            }
+        }
+        Ok(())
+    }
+
     fn run_ephemeral(&mut self, command: String) {
         let command = command.trim();
         if command.is_empty() {
@@ -1389,7 +2010,11 @@ impl App {
             stop_timeout: base.stop_timeout,
             actions: Vec::new(),
         };
-        if let Err(error) = self.runner.add_command(config.clone()) {
+        if let Err(error) = self.runner.add_ephemeral(EphemeralState {
+            config: config.clone(),
+            project: project.clone(),
+            suggested_group: suggested_group.clone(),
+        }) {
             self.message = format!("could not create ephemeral command: {error:#}");
             return;
         }
@@ -1473,19 +2098,14 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| "Project".to_owned())
         };
-        let existing_names = self
-            .groups
-            .iter()
-            .filter(|group| group.project_file == targets[target].file)
-            .flat_map(|group| group.commands.iter().map(|command| command.name.as_str()))
-            .collect::<Vec<_>>();
-        let name = unique_persisted_name(&ephemeral.config.run, &existing_names);
+        let name = ephemeral.config.name.clone();
         let cursor = name.chars().count();
         self.persist_dialog = Some(PersistDialog {
             ephemeral_index,
             name,
             target,
             group,
+            autostart: false,
             field: PersistField::Name,
             cursor,
         });
@@ -1528,15 +2148,17 @@ impl App {
                 dialog.field = match dialog.field {
                     PersistField::Name => PersistField::Project,
                     PersistField::Project => PersistField::Group,
-                    PersistField::Group => PersistField::Name,
+                    PersistField::Group => PersistField::Autostart,
+                    PersistField::Autostart => PersistField::Name,
                 };
                 dialog.cursor = persist_field_text_len(&dialog);
             }
             KeyCode::BackTab | KeyCode::Up => {
                 dialog.field = match dialog.field {
-                    PersistField::Name => PersistField::Group,
+                    PersistField::Name => PersistField::Autostart,
                     PersistField::Project => PersistField::Name,
                     PersistField::Group => PersistField::Project,
+                    PersistField::Autostart => PersistField::Group,
                 };
                 dialog.cursor = persist_field_text_len(&dialog);
             }
@@ -1561,6 +2183,12 @@ impl App {
                     }
                 }
             }
+            KeyCode::Left | KeyCode::Right if dialog.field == PersistField::Autostart => {
+                dialog.autostart = !dialog.autostart;
+            }
+            KeyCode::Char(' ') if dialog.field == PersistField::Autostart => {
+                dialog.autostart = !dialog.autostart;
+            }
             KeyCode::Left | KeyCode::Right
                 if dialog.field == PersistField::Group
                     && key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1583,7 +2211,7 @@ impl App {
                 let value = match dialog.field {
                     PersistField::Name => &dialog.name,
                     PersistField::Group => &dialog.group,
-                    PersistField::Project => unreachable!(),
+                    PersistField::Project | PersistField::Autostart => unreachable!(),
                 };
                 move_text_cursor(&mut dialog.cursor, value, key.code == KeyCode::Right);
             }
@@ -1596,12 +2224,12 @@ impl App {
             KeyCode::Backspace => match dialog.field {
                 PersistField::Name => remove_before_cursor(&mut dialog.name, &mut dialog.cursor),
                 PersistField::Group => remove_before_cursor(&mut dialog.group, &mut dialog.cursor),
-                PersistField::Project => {}
+                PersistField::Project | PersistField::Autostart => {}
             },
             KeyCode::Delete => match dialog.field {
                 PersistField::Name => remove_at_cursor(&mut dialog.name, dialog.cursor),
                 PersistField::Group => remove_at_cursor(&mut dialog.group, dialog.cursor),
-                PersistField::Project => {}
+                PersistField::Project | PersistField::Autostart => {}
             },
             KeyCode::Char(character)
                 if !key
@@ -1615,7 +2243,7 @@ impl App {
                     PersistField::Group => {
                         insert_at_cursor(&mut dialog.group, &mut dialog.cursor, character)
                     }
-                    PersistField::Project => {}
+                    PersistField::Project | PersistField::Autostart => {}
                 }
             }
             _ => {}
@@ -1662,7 +2290,7 @@ impl App {
             run: Some(ephemeral.config.run.clone()),
             cwd: Some(cwd),
             pre: ephemeral.config.pre.clone(),
-            autostart: false,
+            autostart: dialog.autostart,
         };
         if let Err(error) = command_edit::add_with_catalog_quiet(
             &target.file,
@@ -1672,6 +2300,49 @@ impl App {
             self.message = format!("could not persist command: {error:#}");
             self.persist_dialog = Some(dialog);
             return;
+        }
+
+        for action in &ephemeral.config.actions {
+            let action_cwd = (action.cwd != ephemeral.config.cwd).then(|| {
+                action
+                    .cwd
+                    .strip_prefix(&target.root)
+                    .ok()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| action.cwd.display().to_string())
+            });
+            let options = command_edit::ActionOptions {
+                name: action.name.clone(),
+                run: action.run.clone(),
+                cwd: action_cwd,
+                pre: action.pre.clone(),
+                requires_stopped: action.requires_stopped,
+                restart_after: action.restart_after,
+            };
+            if let Err(error) = command_edit::add_action_with_catalog_quiet(
+                &target.file,
+                name,
+                &options,
+                &self.runner.project().theme_catalog,
+            ) {
+                let rollback = command_edit::delete_with_catalog_quiet(
+                    &target.file,
+                    Some(name.to_owned()),
+                    true,
+                    &self.runner.project().theme_catalog,
+                );
+                self.message = format!(
+                    "could not persist sub-command {:?}: {error:#}; command rollback {}",
+                    action.name,
+                    if rollback.is_ok() {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    }
+                );
+                self.persist_dialog = Some(dialog);
+                return;
+            }
         }
 
         let runtime_id = ephemeral.config.id.clone();
@@ -1704,11 +2375,19 @@ impl App {
             });
         }
         self.ephemeral.remove(dialog.ephemeral_index);
-        if let Err(error) = self.runner.update_command(config) {
-            self.message = format!("saved command, but could not update this session: {error:#}");
-        } else {
-            self.message = format!("saved {name:?} to {} / {group_name}", target.label);
-        }
+        let metadata_result = self.runner.mark_ephemeral_persisted(&runtime_id);
+        let update_result = self.runner.update_command(config);
+        self.message = match (metadata_result, update_result) {
+            (_, Err(error)) => {
+                format!("saved command, but could not update this session: {error:#}")
+            }
+            (Err(error), Ok(())) => format!(
+                "saved command, but could not update supervisor session metadata: {error:#}"
+            ),
+            (Ok(()), Ok(())) => {
+                format!("saved {name:?} to {} / {group_name}", target.label)
+            }
+        };
         self.rebuild_command_items(Some(&runtime_id));
         self.reset_log_navigation();
     }
@@ -2729,6 +3408,14 @@ impl App {
                     ephemeral.suggested_group.clone(),
                 ))
             }
+            CommandSelection::EphemeralAction { ephemeral, .. } => {
+                let ephemeral = self.ephemeral.get(ephemeral)?;
+                Some((
+                    ephemeral.config.clone(),
+                    ephemeral.project.clone(),
+                    ephemeral.suggested_group.clone(),
+                ))
+            }
             CommandSelection::Command { group, command }
             | CommandSelection::Action { group, command, .. } => {
                 let group = self.groups.get(group)?;
@@ -2779,11 +3466,17 @@ impl App {
             self.message = "press / for exact search or \\ for regex search".to_owned();
             return;
         };
-        let Some(name) = self.selected_command_name() else {
+        let Some(name) = self.selected_command_name().map(str::to_owned) else {
             self.message = "select a command to search its output".to_owned();
             return;
         };
-        let logs = self.runner.logs(name);
+        let fetched_logs;
+        let logs = if self.log_cache_name.as_deref() == Some(name.as_str()) {
+            &self.log_cache
+        } else {
+            fetched_logs = self.runner.logs(&name);
+            &fetched_logs
+        };
         if logs.is_empty() {
             self.message = "no output to search".to_owned();
             return;
@@ -2828,11 +3521,17 @@ impl App {
     }
 
     fn copy_current_line(&mut self) {
-        let Some(name) = self.selected_command_name() else {
+        let Some(name) = self.selected_command_name().map(str::to_owned) else {
             self.message = "select a command to copy its output".to_owned();
             return;
         };
-        let logs = self.runner.logs(name);
+        let fetched_logs;
+        let logs = if self.log_cache_name.as_deref() == Some(name.as_str()) {
+            &self.log_cache
+        } else {
+            fetched_logs = self.runner.logs(&name);
+            &fetched_logs
+        };
         let Some(line) = logs.get(self.log_cursor.min(logs.len().saturating_sub(1))) else {
             self.message = "no line to copy".to_owned();
             return;
@@ -2989,12 +3688,88 @@ impl App {
         if self.command_picker.is_some() {
             self.draw_command_picker(frame, area);
         }
+        if self.scratchpad.is_some() {
+            self.draw_scratchpad(frame, area);
+        }
         if self.persist_dialog.is_some() {
             self.draw_persist_dialog(frame, area);
         }
         if self.manage.is_some() {
             self.draw_manage(frame, area);
         }
+        if self.confirmation.is_some() {
+            self.draw_confirmation(frame, area);
+        }
+    }
+
+    fn draw_confirmation(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(dialog) = &self.confirmation else {
+            return;
+        };
+        let (title, prompt) = match dialog.action {
+            ConfirmationAction::Quit if self.shutting_down => (
+                " Force quit Blade? ",
+                format!(
+                    "Kill all {} remaining command process group(s) and quit?",
+                    self.runner.active_count()
+                ),
+            ),
+            ConfirmationAction::Quit => {
+                let active = self.runner.active_count();
+                if active == 0 {
+                    (" Quit Blade? ", "Quit Blade?".to_owned())
+                } else {
+                    (
+                        " Quit Blade? ",
+                        format!("Gracefully stop {active} active command(s) and quit Blade?"),
+                    )
+                }
+            }
+            ConfirmationAction::Start => (
+                " Start selected item? ",
+                lifecycle_confirmation_prompt("Start", dialog),
+            ),
+            ConfirmationAction::Stop => (
+                " Stop selected item? ",
+                lifecycle_confirmation_prompt("Stop", dialog),
+            ),
+            ConfirmationAction::Restart => (
+                " Restart selected item? ",
+                lifecycle_confirmation_prompt("Restart", dialog),
+            ),
+            ConfirmationAction::Detach => (
+                " Detach from Blade? ",
+                "Detach this TUI? Running commands will keep running.".to_owned(),
+            ),
+            ConfirmationAction::RestartAndReattach => (
+                " Restart and reattach? ",
+                "Restart the Blade TUI and reattach to this session?".to_owned(),
+            ),
+        };
+        let popup = centered_rect(
+            area.width.saturating_sub(4).min(72),
+            7.min(area.height.saturating_sub(2)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(title)
+            .title_bottom(
+                Line::from(" y/Enter confirm • n/Esc cancel ")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(self.theme.accent)),
+            );
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(
+            Paragraph::new(prompt)
+                .style(Style::default().fg(self.theme.text))
+                .wrap(Wrap { trim: false })
+                .alignment(Alignment::Center),
+            inner,
+        );
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -3066,6 +3841,29 @@ impl App {
                     ),
                     style,
                 ))));
+                for action in &command.actions {
+                    let state = self
+                        .runner
+                        .snapshot(&action.id)
+                        .map(|snapshot| snapshot.state)
+                        .unwrap_or(CommandState::Stopped);
+                    let color = state_color(state, &self.theme);
+                    let style = if items.len() == self.selected_item {
+                        Style::default()
+                            .fg(contrasting_text_color(color))
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        pad_row(
+                            format!("    ↳ {} {}", state_marker(state), action.name),
+                            row_width,
+                        ),
+                        style,
+                    ))));
+                }
             }
         }
         for group in &self.groups {
@@ -3192,6 +3990,54 @@ impl App {
         );
     }
 
+    fn refresh_log_cache(&mut self, name: Option<&str>, snapshot: Option<&RuntimeSnapshot>) {
+        let selection_changed = self.log_cache_name.as_deref() != name;
+        if selection_changed {
+            self.log_cache_name = name.map(str::to_owned);
+            self.log_cache_state = None;
+            self.log_cache.clear();
+        }
+        let Some(name) = name else {
+            return;
+        };
+        let state = snapshot.map(|snapshot| snapshot.state);
+        let metadata = snapshot.and_then(|snapshot| snapshot.log_metadata);
+
+        if let Some(metadata) = metadata {
+            if !log_cache_matches(&self.log_cache, metadata) {
+                let after = self.log_cache.last().map(|line| line.sequence);
+                let updated = self.runner.log_update(name, after).is_some_and(|update| {
+                    let metadata = update.metadata;
+                    merge_log_update(&mut self.log_cache, update);
+                    log_cache_matches(&self.log_cache, metadata)
+                });
+                if !updated {
+                    self.log_cache = self.runner.logs(name);
+                }
+            }
+        } else {
+            // Supervisors started by older compatible binaries do not report log
+            // metadata. Keep their snapshot fixed while the user is browsing, and
+            // refresh once more when the process changes state to capture its tail.
+            let state_changed = self.log_cache_state != state;
+            let interaction_open = !matches!(self.mode, InputMode::Normal)
+                || self.command_picker.is_some()
+                || self.theme_picker.is_some()
+                || self.scratchpad.is_some()
+                || self.persist_dialog.is_some()
+                || self.manage.is_some()
+                || self.confirmation.is_some()
+                || self.show_help;
+            if selection_changed
+                || state_changed
+                || (self.follow && !interaction_open && state.is_some_and(CommandState::is_active))
+            {
+                self.log_cache = self.runner.logs(name);
+            }
+        }
+        self.log_cache_state = state;
+    }
+
     fn draw_logs(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let selected_project = self.selected_project().map(str::to_owned);
         let selected_group = if matches!(
@@ -3204,22 +4050,12 @@ impl App {
         };
         let command_label = self.selected_runnable_label().map(str::to_owned);
         let name = self.selected_command_name().map(str::to_owned);
-        let logs = self
-            .selected_command_name()
-            .map(|name| self.runner.logs(name))
-            .unwrap_or_default();
+        let snapshot = name
+            .as_deref()
+            .and_then(|command_name| self.runner.snapshot(command_name));
+        self.refresh_log_cache(name.as_deref(), snapshot.as_ref());
+        let logs = &self.log_cache;
         self.log_view_height = area.height.saturating_sub(2).max(1) as usize;
-        let previous_log_count = self.observed_log_count;
-        let current_log_tail = logs.last().map(|line| line.sequence);
-        let logs_appended = self.observed_log_tail.is_some()
-            && current_log_tail.is_some()
-            && current_log_tail != self.observed_log_tail;
-        let wrapped_was_at_live_edge =
-            previous_log_count == 0 || self.wrapped_log_end >= previous_log_count.saturating_sub(1);
-        let unwrapped_was_at_live_edge = previous_log_count == 0
-            || self.log_scroll.saturating_add(self.log_view_height) >= previous_log_count;
-        self.observed_log_count = logs.len();
-        self.observed_log_tail = current_log_tail;
         if logs.is_empty() {
             self.log_cursor = 0;
             self.log_scroll = 0;
@@ -3234,14 +4070,6 @@ impl App {
             } else {
                 self.log_cursor = self.log_cursor.min(logs.len() - 1);
                 self.wrapped_log_end = self.wrapped_log_end.min(logs.len() - 1);
-                if logs_appended && !self.wrap_logs && unwrapped_was_at_live_edge {
-                    self.log_scroll = advance_live_scroll(
-                        self.log_scroll,
-                        self.log_cursor,
-                        self.log_view_height,
-                        logs.len(),
-                    );
-                }
             }
             if !self.wrap_logs {
                 if self.log_cursor < self.log_scroll {
@@ -3256,7 +4084,7 @@ impl App {
             let width = area.width.saturating_sub(2).max(1) as usize;
             if self.wrapped_cursor_at_top {
                 let rows = wrapped_log_rows_from(
-                    &logs,
+                    logs,
                     self.log_cursor,
                     self.log_view_height,
                     width,
@@ -3268,13 +4096,12 @@ impl App {
                 rows
             } else {
                 wrapped_log_view(
-                    &logs,
+                    logs,
                     self.log_cursor,
                     &mut self.wrapped_log_end,
                     self.log_view_height,
                     width,
                     self.timestamps,
-                    logs_appended && wrapped_was_at_live_edge,
                 )
             }
         } else {
@@ -3322,9 +4149,6 @@ impl App {
                 Style::default().fg(self.theme.muted),
             )));
         }
-        let snapshot = name
-            .as_deref()
-            .and_then(|command_name| self.runner.snapshot(command_name));
         let state = snapshot
             .as_ref()
             .map(|snapshot| snapshot.state.label())
@@ -3500,24 +4324,24 @@ impl App {
     fn draw_help(&self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered_rect(
             72.min(area.width.saturating_sub(2)),
-            24.min(area.height.saturating_sub(2)),
+            27.min(area.height.saturating_sub(2)),
             area,
         );
         frame.render_widget(Clear, popup);
         let help = vec![
             help_line("Tab", "switch command/output focus"),
             help_line("↑/↓ or j/k", "select group, command, or output line"),
-            help_line("PgUp/PgDn, g/G", "page output; first/last line"),
+            help_line("PgUp/PgDn, g/G", "page; first/end (end resumes follow)"),
             help_line("→ / ←", "focus panes; scroll when wrapping is off"),
             help_line("w", "toggle output wrapping (on by default)"),
             help_line(
                 "h/l (output focus)",
                 "horizontal scroll when wrapping is off",
             ),
-            help_line("Enter or s", "start selected command/group"),
+            help_line("Enter or s", "confirm start selected command/group"),
             help_line("f", "force-start commands waiting for dependencies"),
-            help_line("x", "stop selected command/group; repeat to force"),
-            help_line("r", "restart selected command/group; repeat to force"),
+            help_line("x", "confirm stop; repeat and confirm to force"),
+            help_line("r", "confirm restart; repeat and confirm to force"),
             help_line("/ then n/N", "exact substring; next/previous"),
             help_line("\\ then n/N", "case-insensitive regex; next/previous"),
             help_line("t", "toggle timestamps (on by default)"),
@@ -3526,10 +4350,13 @@ impl App {
             help_line("d", "dump all output to a new file"),
             help_line("T", "preview and apply a project theme"),
             help_line(":", "run a new ephemeral command"),
+            help_line(";", "fork a command or edit an ephemeral in place"),
             help_line("p / D", "persist / remove selected ephemeral command"),
             help_line("M", "manage commands and nested actions"),
             help_line("Ctrl-P", "quick jump to a command"),
-            help_line("q or Ctrl-C", "graceful quit; repeat to force"),
+            help_line("Q", "confirm detach while commands keep running"),
+            help_line("R", "confirm restart and reattach"),
+            help_line("q or Ctrl-C", "confirm quit; repeat and confirm to force"),
         ];
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3557,6 +4384,155 @@ impl App {
         frame.render_widget(Paragraph::new(help), columns[1]);
     }
 
+    fn draw_scratchpad(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(dialog) = &self.scratchpad else {
+            return;
+        };
+        let popup = centered_rect(
+            area.width.saturating_sub(6).min(100),
+            17.min(area.height.saturating_sub(4)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(if dialog.ephemeral_action.is_some() {
+                " Edit ephemeral sub-command in place "
+            } else if dialog.ephemeral_index.is_some() {
+                " Edit ephemeral command in place "
+            } else {
+                " Fork command to scratchpad "
+            })
+            .title_bottom(
+                Line::from(
+                    " Tab fields • Alt-←/→ pre • Ctrl-N/D add/remove pre • Enter run • Esc ",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(self.theme.accent)),
+            );
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let style = |field| {
+            if dialog.field == field {
+                Style::default()
+                    .fg(self.theme.accent_text)
+                    .bg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.theme.text)
+            }
+        };
+        let width = inner.width as usize;
+        let mut lines = vec![
+            Line::from(Span::styled(
+                pad_row(format!(" Source: {}", dialog.base.name), width),
+                Style::default().fg(self.theme.muted),
+            )),
+            Line::from(""),
+        ];
+        push_form_field(
+            &mut lines,
+            format!(
+                " Name [type]: {}",
+                form_text_value(
+                    &dialog.name,
+                    dialog.field == ScratchField::Name,
+                    dialog.cursor,
+                    "scratchpad name"
+                )
+            ),
+            style(ScratchField::Name),
+            width,
+        );
+        push_form_field(
+            &mut lines,
+            format!(
+                " Run [type]: {}",
+                form_text_value(
+                    &dialog.run,
+                    dialog.field == ScratchField::Run,
+                    dialog.cursor,
+                    "shell command"
+                )
+            ),
+            style(ScratchField::Run),
+            width,
+        );
+        push_form_field(
+            &mut lines,
+            format!(
+                " Cwd [type]: {}",
+                form_text_value(
+                    &dialog.cwd,
+                    dialog.field == ScratchField::Cwd,
+                    dialog.cursor,
+                    "project root"
+                )
+            ),
+            style(ScratchField::Cwd),
+            width,
+        );
+        push_form_field(
+            &mut lines,
+            format!(
+                " Pre {}/{} [type/Alt-←→]: {}",
+                dialog.pre_index + 1,
+                dialog.pre.len(),
+                form_text_value(
+                    &dialog.pre[dialog.pre_index],
+                    dialog.field == ScratchField::Pre,
+                    dialog.cursor,
+                    "no pre-step"
+                )
+            ),
+            style(ScratchField::Pre),
+            width,
+        );
+        lines.pop();
+        let scroll = form_scroll(&lines, inner.height as usize);
+        let content_length = lines.len();
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+        render_vertical_scrollbar(
+            frame,
+            popup,
+            content_length,
+            scroll as usize,
+            inner.height as usize,
+            &self.theme,
+        );
+        if let Some(error) = &dialog.error {
+            self.draw_scratchpad_error(frame, popup, error);
+        }
+    }
+
+    fn draw_scratchpad_error(&self, frame: &mut Frame<'_>, area: Rect, error: &str) {
+        let popup = centered_rect(
+            area.width.saturating_sub(8).min(72),
+            7.min(area.height.saturating_sub(4)),
+            area,
+        );
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.failed))
+            .title(" Cannot run scratchpad ")
+            .title_bottom(
+                Line::from(" Enter/Esc return to the form ")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(self.theme.failed)),
+            );
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(
+            Paragraph::new(error)
+                .style(Style::default().fg(self.theme.failed))
+                .wrap(Wrap { trim: false })
+                .alignment(Alignment::Center),
+            inner,
+        );
+    }
+
     fn draw_persist_dialog(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(dialog) = &self.persist_dialog else {
             return;
@@ -3577,9 +4553,11 @@ impl App {
             .border_style(Style::default().fg(self.theme.accent))
             .title(" Add ephemeral command to project ")
             .title_bottom(
-                Line::from(" Tab • ←/→ cursor/choice • Alt-←/→ groups • Enter save • Esc ")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(self.theme.accent)),
+                Line::from(
+                    " Tab • ←/→ cursor/choice • Space toggle • Alt-←/→ groups • Enter save • Esc ",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(self.theme.accent)),
             );
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -3630,6 +4608,18 @@ impl App {
                 )
             ),
             field_style(PersistField::Group),
+            width,
+        );
+        push_form_field(
+            &mut rows,
+            format!(
+                " Autostart [←/→/Space]: {}",
+                form_choice_value(
+                    if dialog.autostart { "Yes" } else { "No" },
+                    dialog.field == PersistField::Autostart
+                )
+            ),
+            field_style(PersistField::Autostart),
             width,
         );
         rows.pop();
@@ -4358,21 +5348,61 @@ fn ephemeral_label(command: &str) -> String {
     }
 }
 
-fn unique_persisted_name(command: &str, existing: &[&str]) -> String {
-    let executable = command
-        .split_whitespace()
-        .next()
-        .and_then(|word| Path::new(word).file_name())
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("command");
-    if !existing.contains(&executable) {
-        return executable.to_owned();
+fn editable_cwd(command: &CommandConfig) -> String {
+    command
+        .cwd
+        .strip_prefix(&command.project_root)
+        .ok()
+        .map(|path| {
+            if path.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                path.display().to_string()
+            }
+        })
+        .unwrap_or_else(|| command.cwd.display().to_string())
+}
+
+fn resolve_scratch_cwd(project_root: &Path, value: &str) -> PathBuf {
+    let value = if value.is_empty() { "." } else { value };
+    let path = if value == "~" {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(value))
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(value))
+    } else {
+        PathBuf::from(value)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
     }
-    (2..)
-        .map(|suffix| format!("{executable}-{suffix}"))
-        .find(|name| !existing.contains(&name.as_str()))
-        .expect("an unused generated command name must exist")
+}
+
+fn next_scratch_field(field: ScratchField, backwards: bool) -> ScratchField {
+    match (field, backwards) {
+        (ScratchField::Name, false) => ScratchField::Run,
+        (ScratchField::Run, false) => ScratchField::Cwd,
+        (ScratchField::Cwd, false) => ScratchField::Pre,
+        (ScratchField::Pre, false) => ScratchField::Name,
+        (ScratchField::Name, true) => ScratchField::Pre,
+        (ScratchField::Run, true) => ScratchField::Name,
+        (ScratchField::Cwd, true) => ScratchField::Run,
+        (ScratchField::Pre, true) => ScratchField::Cwd,
+    }
+}
+
+fn scratch_field_text_len(dialog: &ScratchDialog) -> usize {
+    match dialog.field {
+        ScratchField::Name => dialog.name.chars().count(),
+        ScratchField::Run => dialog.run.chars().count(),
+        ScratchField::Cwd => dialog.cwd.chars().count(),
+        ScratchField::Pre => dialog.pre[dialog.pre_index].chars().count(),
+    }
 }
 
 fn next_manage_field(field: ManageField, backwards: bool) -> ManageField {
@@ -4478,7 +5508,7 @@ fn persist_field_text_len(dialog: &PersistDialog) -> usize {
     match dialog.field {
         PersistField::Name => dialog.name.chars().count(),
         PersistField::Group => dialog.group.chars().count(),
-        PersistField::Project => 0,
+        PersistField::Project | PersistField::Autostart => 0,
     }
 }
 
@@ -4683,6 +5713,15 @@ fn help_line(key: &str, description: &str) -> Line<'static> {
     ])
 }
 
+fn lifecycle_confirmation_prompt(action: &str, dialog: &ConfirmationDialog) -> String {
+    let label = dialog.label.as_deref().unwrap_or("selected item");
+    if dialog.target_count == 1 {
+        format!("{action} {label}?")
+    } else {
+        format!("{action} {label} ({} commands)?", dialog.target_count)
+    }
+}
+
 fn footer_shortcuts(width: u16, rows: u16) -> Vec<(&'static str, &'static str)> {
     const PRIMARY: [(&str, &str); 12] = [
         ("Ctrl-P", " jump  "),
@@ -4698,9 +5737,12 @@ fn footer_shortcuts(width: u16, rows: u16) -> Vec<(&'static str, &'static str)> 
         ("d", " dump  "),
         ("q", " quit  "),
     ];
-    const SECONDARY: [(&str, &str); 11] = [
+    const SECONDARY: [(&str, &str); 14] = [
         ("c", " clear  "),
         (":", " ephemeral  "),
+        (";", " scratch  "),
+        ("Q", " detach  "),
+        ("R", " reload  "),
         ("p/D", " save/remove  "),
         ("M", " manage  "),
         ("Tab", " focus  "),
@@ -4828,6 +5870,27 @@ fn search_expression(query: &str, kind: SearchKind) -> String {
     }
 }
 
+fn log_cache_matches(logs: &[LogLine], metadata: LogMetadata) -> bool {
+    logs.len() == metadata.count
+        && logs.first().map(|line| line.sequence) == metadata.first_sequence
+        && logs.last().map(|line| line.sequence) == metadata.last_sequence
+}
+
+fn merge_log_update(logs: &mut Vec<LogLine>, update: LogUpdate) {
+    if let Some(first_sequence) = update.metadata.first_sequence {
+        logs.retain(|line| line.sequence >= first_sequence);
+    } else {
+        logs.clear();
+    }
+    let previous_tail = logs.last().map(|line| line.sequence);
+    logs.extend(
+        update
+            .lines
+            .into_iter()
+            .filter(|line| previous_tail.is_none_or(|sequence| line.sequence > sequence)),
+    );
+}
+
 fn wrapped_log_rows(
     logs: &[LogLine],
     end: usize,
@@ -4886,18 +5949,13 @@ fn wrapped_log_view(
     height: usize,
     width: usize,
     timestamps: bool,
-    extend_to_live_edge: bool,
 ) -> Vec<(usize, String)> {
     if logs.is_empty() {
         *end = 0;
         return Vec::new();
     }
 
-    *end = if extend_to_live_edge {
-        logs.len() - 1
-    } else {
-        (*end).min(logs.len() - 1)
-    };
+    *end = (*end).min(logs.len() - 1);
     let mut rows = wrapped_log_rows(logs, *end, height, width, timestamps);
     if !rows.iter().any(|(index, _)| *index == cursor) {
         if rows
@@ -4914,18 +5972,6 @@ fn wrapped_log_view(
         }
     }
     rows
-}
-
-fn advance_live_scroll(
-    current_scroll: usize,
-    cursor: usize,
-    height: usize,
-    log_count: usize,
-) -> usize {
-    log_count
-        .saturating_sub(height)
-        .min(cursor)
-        .max(current_scroll)
 }
 
 fn wrap_log_text(text: &str, width: usize) -> Vec<String> {
@@ -5128,20 +6174,23 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use crate::{
-        config::{RestartAfter, combine_projects, validate_file, validate_file_with_catalog},
+        config::{
+            RestartAfter, action_id, combine_projects, validate_file, validate_file_with_catalog,
+        },
         log_buffer::{LogBuffer, LogKind},
         project_list::ProjectEntry,
-        runner::Runner,
+        runner::{CommandState, Runner},
         theme::{Theme, ThemeOverrides},
     };
 
     use super::{
-        App, CommandSelection, Focus, InputMode, ManageActionEditDialog, ManageActionField,
-        ManageEditDialog, ManageEditMode, ManageField, SearchKind, advance_live_scroll,
-        build_search_regex, draw_project_list, footer_shortcuts, form_choice_value,
-        form_text_value, fuzzy_score, help_line, render_vertical_scrollbar,
-        search_needs_top_alignment, spawn_clipboard_writer, styled_log_line, theme_description,
-        theme_picker_row, wrap_log_text, wrapped_log_view, write_dump,
+        App, CommandSelection, ConfirmationAction, Focus, InputMode, ManageActionEditDialog,
+        ManageActionField, ManageEditDialog, ManageEditMode, ManageField, PersistField, RunOutcome,
+        ScratchField, SearchKind, build_search_regex, draw_project_list, footer_shortcuts,
+        form_choice_value, form_text_value, fuzzy_score, help_line, log_cache_matches,
+        merge_log_update, render_vertical_scrollbar, search_needs_top_alignment,
+        spawn_clipboard_writer, styled_log_line, theme_description, theme_picker_row,
+        wrap_log_text, wrapped_log_view, write_dump,
     };
 
     fn wait_until_inactive(app: &App, id: &str) {
@@ -5385,6 +6434,200 @@ run = "true"
     }
 
     #[test]
+    fn scratchpad_forks_and_edits_a_command_with_in_memory_adjustments() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("original")).unwrap();
+        fs::create_dir(directory.path().join("scratch")).unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+name = "Test"
+shell = "/bin/sh"
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "echo original"
+cwd = "original"
+shell_setup = ["export FROM_SETUP=setup"]
+pre = ["export FROM_PRE=original"]
+autostart = true
+log_file = ".blade-logs/base.log"
+[[groups.commands.wait_for]]
+command = "dependency"
+kind = "delay"
+seconds = 0
+[[groups.commands.actions]]
+name = "inspect"
+run = "echo action"
+cwd = "original"
+pre = ["export ACTION_PRE=source"]
+[[groups.commands]]
+name = "dependency"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let original_file = fs::read_to_string(&path).unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+
+        app.open_scratchpad();
+        let dialog = app.scratchpad.as_mut().unwrap();
+        assert_eq!(dialog.name, "base");
+        assert_eq!(dialog.run, "echo original");
+        assert_eq!(dialog.cwd, "original");
+        assert_eq!(dialog.pre, ["export FROM_PRE=original"]);
+        dialog.name = "Worktree server".to_owned();
+        dialog.run =
+            r#"printf 'cwd=%s setup=%s pre=%s\n' "$PWD" "$FROM_SETUP" "$FROM_PRE""#.to_owned();
+        dialog.cwd = "scratch".to_owned();
+        dialog.pre = vec!["export FROM_PRE=scratch".to_owned()];
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.scratchpad.is_none());
+        let scratch = &app.ephemeral[0].config;
+        let id = scratch.id.clone();
+        assert_eq!(scratch.name, "Worktree server");
+        assert_eq!(scratch.cwd, directory.path().join("scratch"));
+        assert_eq!(scratch.pre, ["export FROM_PRE=scratch"]);
+        assert!(scratch.wait_for.is_empty());
+        assert_eq!(scratch.actions.len(), 1);
+        assert_eq!(scratch.actions[0].name, "inspect");
+        assert_eq!(scratch.actions[0].cwd, directory.path().join("scratch"));
+        assert_eq!(scratch.actions[0].parent_id, id);
+        assert_eq!(scratch.actions[0].id, action_id(&id, "inspect"));
+        assert!(!scratch.autostart);
+        assert!(scratch.log_dir.is_none());
+        assert!(scratch.log_file.is_none());
+        assert!(scratch.log_rotate_bytes.is_none());
+        wait_until_inactive(&app, &id);
+
+        assert!(app.runner.logs(&id).iter().any(|line| {
+            line.text
+                == format!(
+                    "cwd={} setup=setup pre=scratch",
+                    directory.path().join("scratch").display()
+                )
+        }));
+
+        app.open_scratchpad();
+        let dialog = app.scratchpad.as_mut().unwrap();
+        assert_eq!(dialog.ephemeral_index, Some(0));
+        assert_eq!(dialog.name, "Worktree server");
+        dialog.name = "Renamed server".to_owned();
+        dialog.run = "echo EDITED_IN_PLACE".to_owned();
+        dialog.cwd = "original".to_owned();
+        dialog.pre = vec![String::new()];
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        wait_until_inactive(&app, &id);
+
+        assert_eq!(app.ephemeral.len(), 1);
+        assert_eq!(app.ephemeral[0].config.id, id);
+        assert_eq!(app.ephemeral[0].config.name, "Renamed server");
+        assert_eq!(app.ephemeral[0].config.run, "echo EDITED_IN_PLACE");
+        let logs = app.runner.logs(&id);
+        assert!(logs.iter().any(|line| line.text == "EDITED_IN_PLACE"));
+        assert!(logs.iter().any(|line| {
+            line.text
+                == format!(
+                    "cwd={} setup=setup pre=scratch",
+                    directory.path().join("scratch").display()
+                )
+        }));
+
+        let action_item = app
+            .command_items
+            .iter()
+            .position(|item| matches!(item, CommandSelection::EphemeralAction { .. }))
+            .unwrap();
+        assert_eq!(
+            app.command_picker_label(action_item).as_deref(),
+            Some("Ephemeral / Renamed server › inspect")
+        );
+        app.selected_item = action_item;
+        app.open_scratchpad();
+        let dialog = app.scratchpad.as_mut().unwrap();
+        assert_eq!(dialog.ephemeral_index, Some(0));
+        assert_eq!(dialog.ephemeral_action, Some(0));
+        assert_eq!(dialog.name, "inspect");
+        assert_eq!(dialog.cwd, "original");
+        assert_eq!(dialog.pre, ["export ACTION_PRE=source"]);
+        dialog.name = "inspect scratch".to_owned();
+        dialog.run = r#"printf 'action-cwd=%s pre=%s\n' "$PWD" "$ACTION_PRE""#.to_owned();
+        dialog.cwd = "scratch".to_owned();
+        dialog.pre = vec!["export ACTION_PRE=edited".to_owned()];
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action_id = action_id(&id, "inspect scratch");
+        wait_until_inactive(&app, &action_id);
+
+        assert_eq!(app.ephemeral.len(), 1);
+        let action = &app.ephemeral[0].config.actions[0];
+        assert_eq!(action.name, "inspect scratch");
+        assert_eq!(action.cwd, directory.path().join("scratch"));
+        assert_eq!(action.pre, ["export ACTION_PRE=edited"]);
+        assert!(app.runner.logs(&action_id).iter().any(|line| {
+            line.text
+                == format!(
+                    "action-cwd={} pre=edited",
+                    directory.path().join("scratch").display()
+                )
+        }));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original_file);
+        assert_eq!(
+            app.groups[0].commands[0].cwd,
+            directory.path().join("original")
+        );
+        assert_eq!(app.groups[0].commands[0].run, "echo original");
+    }
+
+    #[test]
+    fn scratchpad_shortcut_can_fork_an_action_and_edit_pre_steps() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+name = "Test"
+shell = "/bin/sh"
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "true"
+[[groups.commands.actions]]
+name = "inspect"
+run = "echo action"
+pre = ["echo action-pre"]
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.selected_item = app
+            .command_items
+            .iter()
+            .position(|item| matches!(item, CommandSelection::Action { .. }))
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE))
+            .unwrap();
+        let dialog = app.scratchpad.as_ref().unwrap();
+        assert_eq!(dialog.name, "inspect");
+        assert_eq!(dialog.run, "echo action");
+        assert_eq!(dialog.pre, ["echo action-pre"]);
+
+        let dialog = app.scratchpad.as_mut().unwrap();
+        dialog.field = ScratchField::Pre;
+        dialog.cursor = dialog.pre[0].chars().count();
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.scratchpad.as_ref().unwrap().pre.len(), 2);
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.scratchpad.as_ref().unwrap().pre, ["echo action-pre"]);
+    }
+
+    #[test]
     fn nested_actions_join_the_command_tree_quick_jump_and_output_pane() {
         let directory = tempdir().unwrap();
         let path = directory.path().join(".blade");
@@ -5550,6 +6793,57 @@ run = "true"
                     .iter()
                     .any(|command| command.name == "saved-task")
         }));
+    }
+
+    #[test]
+    fn persisting_a_scratchpad_includes_its_cloned_sub_commands() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "true"
+[[groups.commands.actions]]
+name = "migrate"
+run = "echo migrated"
+pre = ["echo preparing"]
+requires_stopped = true
+restart_after = "if-running"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.open_scratchpad();
+        app.scratchpad.as_mut().unwrap().name = "current scratch name".to_owned();
+        app.handle_scratchpad_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let id = app.ephemeral[0].config.id.clone();
+        wait_until_inactive(&app, &id);
+
+        app.open_persist_dialog();
+        let dialog = app.persist_dialog.as_mut().unwrap();
+        assert_eq!(dialog.name, "current scratch name");
+        dialog.group = "Utilities".to_owned();
+        dialog.field = PersistField::Autostart;
+        app.handle_persist_dialog_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.persist_ephemeral();
+
+        let saved = validate_file(&path).project.unwrap();
+        let command = saved.command("current scratch name").unwrap();
+        assert!(command.autostart);
+        assert_eq!(command.actions.len(), 1);
+        let action = &command.actions[0];
+        assert_eq!(action.name, "migrate");
+        assert_eq!(action.run, "echo migrated");
+        assert_eq!(action.pre, ["echo preparing"]);
+        assert!(action.requires_stopped);
+        assert_eq!(action.restart_after, RestartAfter::IfRunning);
+        assert!(app.ephemeral.is_empty());
     }
 
     #[test]
@@ -6012,6 +7306,9 @@ run = "true"
         for key in [
             "c",
             ":",
+            ";",
+            "Q",
+            "R",
             "p/D",
             "M",
             "Tab",
@@ -6025,6 +7322,159 @@ run = "true"
             assert!(wide.iter().any(|(candidate, _)| *candidate == key));
         }
         assert_eq!(wide.last().map(|(key, _)| *key), Some("?"));
+    }
+
+    #[test]
+    fn lifecycle_and_session_shortcuts_open_confirmation_dialogs() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+
+        let mut app = App::new(Runner::new(project));
+        for (key, action) in [
+            (KeyCode::Enter, ConfirmationAction::Start),
+            (KeyCode::Char('s'), ConfirmationAction::Start),
+            (KeyCode::Char('x'), ConfirmationAction::Stop),
+            (KeyCode::Char('r'), ConfirmationAction::Restart),
+            (KeyCode::Char('q'), ConfirmationAction::Quit),
+            (KeyCode::Char('Q'), ConfirmationAction::Detach),
+            (KeyCode::Char('R'), ConfirmationAction::RestartAndReattach),
+        ] {
+            assert!(
+                !app.handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                    .unwrap()
+            );
+            assert_eq!(
+                app.confirmation.as_ref().map(|dialog| dialog.action),
+                Some(action)
+            );
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.confirmation.is_none());
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(
+            app.confirmation.as_ref().map(|dialog| dialog.action),
+            Some(ConfirmationAction::Quit)
+        );
+    }
+
+    #[test]
+    fn confirming_or_cancelling_session_actions_controls_exit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+
+        let mut detached = App::new(Runner::new(project.clone()));
+        assert!(
+            !detached
+                .handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(
+            !detached
+                .handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert_eq!(detached.exit_action, RunOutcome::Quit);
+        detached
+            .handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            detached
+                .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert_eq!(detached.exit_action, RunOutcome::Detached);
+
+        let mut reloaded = App::new(Runner::new(project));
+        assert!(
+            !reloaded
+                .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(
+            reloaded
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert_eq!(reloaded.exit_action, RunOutcome::Reload);
+    }
+
+    #[test]
+    fn confirmed_lifecycle_actions_execute_only_after_confirmation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+stop_timeout = 0.1
+[[groups]]
+name = "Project"
+[[groups.commands]]
+name = "base"
+run = "sleep 30"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.runner.snapshot("base").unwrap().state,
+            CommandState::Stopped
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.runner.snapshot("base").unwrap().state.is_active());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.runner.snapshot("base").unwrap().state.is_active());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        wait_until_inactive(&app, "base");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.runner.snapshot("base").unwrap().state,
+            CommandState::Stopped
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.runner.snapshot("base").unwrap().state.is_active());
+        app.runner.shutdown(true);
+        wait_until_inactive(&app, "base");
     }
 
     #[test]
@@ -6390,7 +7840,7 @@ run = "true"
         let mut end = 2;
 
         assert!(!search_needs_top_alignment(true, Some((0, 2)), 4));
-        let rows = wrapped_log_view(&logs, 4, &mut end, 3, 20, false, false);
+        let rows = wrapped_log_view(&logs, 4, &mut end, 3, 20, false);
 
         assert_eq!(
             rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
@@ -6428,6 +7878,75 @@ run = "true"
     }
 
     #[test]
+    fn log_cache_merges_new_lines_and_drops_evicted_lines() {
+        let mut buffer = LogBuffer::new(3);
+        buffer.push(LogKind::Output, "one");
+        let second = buffer.push(LogKind::Output, "two");
+        let mut cache = Vec::new();
+
+        let initial = buffer.update_since(None);
+        let initial_metadata = initial.metadata;
+        merge_log_update(&mut cache, initial);
+        assert!(log_cache_matches(&cache, initial_metadata));
+
+        buffer.push(LogKind::Output, "three");
+        buffer.push(LogKind::Output, "four");
+        let update = buffer.update_since(Some(second.sequence));
+        let update_metadata = update.metadata;
+        merge_log_update(&mut cache, update);
+
+        assert!(log_cache_matches(&cache, update_metadata));
+        assert_eq!(
+            cache
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["two", "three", "four"]
+        );
+    }
+
+    #[test]
+    fn reaching_the_newest_cached_log_line_resumes_following() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        let mut buffer = LogBuffer::new(4);
+        for text in ["one", "two", "three", "four"] {
+            buffer.push(LogKind::Output, text);
+        }
+        app.log_cache_name = Some("command".to_owned());
+        app.log_cache = buffer.snapshot();
+        app.log_cursor = 1;
+        app.follow = false;
+
+        app.move_log_cursor(1);
+
+        assert_eq!(app.log_cursor, 2);
+        assert!(!app.follow);
+
+        app.move_log_cursor(1);
+        assert_eq!(app.log_cursor, 3);
+        assert!(app.follow);
+
+        app.move_log_cursor(-1);
+        assert_eq!(app.log_cursor, 2);
+        assert!(!app.follow);
+    }
+
+    #[test]
     fn moving_up_keeps_subsequent_wrapped_lines_visible() {
         let mut buffer = LogBuffer::new(10);
         for line in ["zero", "one", "two", "three", "four"] {
@@ -6436,14 +7955,14 @@ run = "true"
         let logs = buffer.snapshot();
         let mut end = 4;
 
-        let rows = wrapped_log_view(&logs, 3, &mut end, 3, 20, false, false);
+        let rows = wrapped_log_view(&logs, 3, &mut end, 3, 20, false);
         assert_eq!(
             rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             [2, 3, 4]
         );
         assert_eq!(end, 4);
 
-        let rows = wrapped_log_view(&logs, 1, &mut end, 3, 20, false, false);
+        let rows = wrapped_log_view(&logs, 1, &mut end, 3, 20, false);
         assert_eq!(
             rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             [1, 2, 3]
@@ -6452,7 +7971,7 @@ run = "true"
     }
 
     #[test]
-    fn incoming_wrapped_lines_fill_space_below_the_selection() {
+    fn incoming_wrapped_lines_do_not_move_the_browsing_viewport() {
         let mut buffer = LogBuffer::new(10);
         for line in ["zero", "one", "two", "three"] {
             buffer.push(LogKind::Output, line);
@@ -6461,20 +7980,13 @@ run = "true"
         buffer.push(LogKind::Output, "four");
         let logs = buffer.snapshot();
 
-        let rows = wrapped_log_view(&logs, 2, &mut end, 5, 20, false, true);
+        let rows = wrapped_log_view(&logs, 2, &mut end, 3, 20, false);
 
         assert_eq!(
             rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4]
+            [1, 2, 3]
         );
-        assert_eq!(end, 4);
-    }
-
-    #[test]
-    fn incoming_unwrapped_lines_scroll_until_the_selection_reaches_the_top() {
-        assert_eq!(advance_live_scroll(0, 3, 5, 6), 1);
-        assert_eq!(advance_live_scroll(1, 3, 5, 8), 3);
-        assert_eq!(advance_live_scroll(3, 3, 5, 9), 3);
+        assert_eq!(end, 3);
     }
 
     #[test]

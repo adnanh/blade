@@ -4,6 +4,7 @@ mod init;
 mod log_buffer;
 mod project_list;
 mod runner;
+mod supervisor;
 mod theme;
 mod tui;
 
@@ -25,9 +26,9 @@ use crate::{
         GlobalSettings, GlobalTheme, ProjectEntry, candidate_paths, find_file as find_project_list,
         home_directory,
     },
-    runner::Runner,
+    supervisor::{RunnerHandle, SessionProject, SessionSource},
     theme::{ThemeCatalog, ThemeOverrides},
-    tui::StartupMode,
+    tui::{RunOutcome, StartupMode},
 };
 
 #[derive(Debug, Parser)]
@@ -89,6 +90,12 @@ enum Action {
         #[command(flatten)]
         startup: StartupOptions,
     },
+    /// Attach to a detached Blade session.
+    Attach {
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+    },
     /// Interactively create a .blade project file.
     Init {
         /// File or project directory to initialize.
@@ -109,6 +116,11 @@ enum Action {
     Command {
         #[command(subcommand)]
         action: CommandAction,
+    },
+    #[command(name = "__supervisor", hide = true)]
+    Supervisor {
+        #[arg(long, value_name = "PATH")]
+        session_file: PathBuf,
     },
 }
 
@@ -251,6 +263,19 @@ fn execute(cli: Cli) -> Result<u8> {
         bail!("--all, --no-autostart, and --global may only be used when running Blade");
     }
     match action {
+        Action::Attach { session } => {
+            let descriptor = supervisor::find_descriptor(session.as_deref())?;
+            let project = load_session_project(&descriptor.source)?;
+            let runner = supervisor::connect_existing(project, descriptor)?;
+            run_tui_session(runner, StartupMode::None)?;
+            Ok(0)
+        }
+        Action::Supervisor { session_file } => {
+            let descriptor = supervisor::load_descriptor(&session_file)?;
+            let project = load_session_project(&descriptor.source)?;
+            supervisor::serve(project, descriptor)?;
+            Ok(0)
+        }
         Action::Init { path, force } => {
             let path = project_path(path.or(cli.file), false)?;
             init::initialize(&path, force)?;
@@ -390,41 +415,29 @@ fn execute(cli: Cli) -> Result<u8> {
             let Some(target) = run_target(cli.file, startup.global)? else {
                 return Ok(0);
             };
-            let project = match target {
-                RunTarget::Project(path) => {
-                    let settings = active_global_settings();
-                    let mut project = load_project(&path, false, &settings.theme_catalog)?;
-                    if !project.theme_preset_configured
-                        && let Some(theme) = settings.theme
-                    {
-                        apply_global_theme(&mut project, &theme, false);
-                    }
-                    project
-                }
+            let source = match target {
+                RunTarget::Project(path) => SessionSource::Project {
+                    path: path
+                        .canonicalize()
+                        .with_context(|| format!("could not resolve {}", path.display()))?,
+                },
                 RunTarget::Combined {
                     project_list,
                     projects,
-                } => {
-                    let settings = project_list::load_settings(&project_list, &home_directory()?)?;
-                    let mut loaded = Vec::with_capacity(projects.len());
-                    for project in projects {
-                        loaded.push((
-                            project.name,
-                            load_project(&project.path, true, &settings.theme_catalog)?,
-                        ));
-                    }
-                    let mut project = combine_projects(project_list.clone(), loaded)?;
-                    if let Some(theme) = &settings.theme {
-                        apply_global_theme(&mut project, theme, true);
-                    }
-                    project.theme_catalog = settings.theme_catalog;
-                    project.theme_file = Some(project_list);
-                    project.theme_file_is_global = true;
-                    project.theme_configured = settings.theme.is_some();
-                    project.theme_preset_configured = settings.theme.is_some();
-                    project
-                }
+                } => SessionSource::Combined {
+                    project_list,
+                    projects: projects
+                        .into_iter()
+                        .map(|project| SessionProject {
+                            name: project.name,
+                            path: project.path,
+                        })
+                        .collect(),
+                },
             };
+            let project = load_session_project(&source)?;
+            let descriptor = supervisor::descriptor_for(source, project.name.clone())?;
+            let (runner, fresh) = supervisor::connect_or_spawn(project, descriptor)?;
             let startup = if startup.all {
                 StartupMode::All
             } else if startup.no_autostart {
@@ -432,8 +445,74 @@ fn execute(cli: Cli) -> Result<u8> {
             } else {
                 StartupMode::Configured
             };
-            tui::run(Runner::new(project), startup)?;
+            run_tui_session(runner, if fresh { startup } else { StartupMode::None })?;
             Ok(0)
+        }
+    }
+}
+
+fn load_session_project(source: &SessionSource) -> Result<ProjectConfig> {
+    match source {
+        SessionSource::Project { path } => {
+            let settings = active_global_settings();
+            let mut project = load_project(path, false, &settings.theme_catalog)?;
+            if !project.theme_preset_configured
+                && let Some(theme) = settings.theme
+            {
+                apply_global_theme(&mut project, &theme, false);
+            }
+            Ok(project)
+        }
+        SessionSource::Combined {
+            project_list,
+            projects,
+        } => {
+            let settings = project_list::load_settings(project_list, &home_directory()?)?;
+            let mut loaded = Vec::with_capacity(projects.len());
+            for project in projects {
+                loaded.push((
+                    project.name.clone(),
+                    load_project(&project.path, true, &settings.theme_catalog)?,
+                ));
+            }
+            let mut project = combine_projects(project_list.clone(), loaded)?;
+            if let Some(theme) = &settings.theme {
+                apply_global_theme(&mut project, theme, true);
+            }
+            project.theme_catalog = settings.theme_catalog;
+            project.theme_file = Some(project_list.clone());
+            project.theme_file_is_global = true;
+            project.theme_configured = settings.theme.is_some();
+            project.theme_preset_configured = settings.theme.is_some();
+            Ok(project)
+        }
+    }
+}
+
+fn run_tui_session(runner: RunnerHandle, startup: StartupMode) -> Result<()> {
+    let mut startup = startup;
+    let mut message = None;
+    loop {
+        match tui::run(runner.clone(), startup, message.take())? {
+            RunOutcome::Quit => {
+                runner.terminate_session()?;
+                return Ok(());
+            }
+            RunOutcome::Detached => return Ok(()),
+            RunOutcome::Reload => {
+                let session = runner
+                    .session_id()
+                    .context("only supervised Blade sessions can be reloaded")?;
+                let executable = runner
+                    .reload_executable()
+                    .context("could not locate the Blade executable used by this client")?;
+                if let Err(error) = supervisor::exec_attach(executable, session) {
+                    message = Some(format!(
+                        "reload failed; continuing with current UI: {error:#}"
+                    ));
+                    startup = StartupMode::None;
+                }
+            }
         }
     }
 }
@@ -815,6 +894,22 @@ mod tests {
             Some(Action::Run {
                 startup: StartupOptions { all: true, .. }
             })
+        ));
+    }
+
+    #[test]
+    fn attach_accepts_an_optional_session_identifier() {
+        let explicit = Cli::try_parse_from(["blade", "attach", "abc123"]).unwrap();
+        assert!(matches!(
+            explicit.command,
+            Some(Action::Attach {
+                session: Some(session)
+            }) if session == "abc123"
+        ));
+        let implicit = Cli::try_parse_from(["blade", "attach"]).unwrap();
+        assert!(matches!(
+            implicit.command,
+            Some(Action::Attach { session: None })
         ));
     }
 

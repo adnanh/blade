@@ -10,40 +10,7 @@ Display the discovered local project in a readable form:
 blade command list
 ```
 
-The output includes the project theme, log-buffer size, groups, commands, run commands, working directories, shell, pre-steps, readiness dependencies, shutdown timeout, autostart state, and logfile rotation. For example:
-
-```
-Project: My app
-  File: /home/user/project/.blade
-  Theme: nord
-  Max log lines: 100000
-  Groups: 2
-    Project (2 commands):
-      - api [autostart]
-        Run: yarn dev:api
-        Cwd: /home/user/project
-        Shell: /bin/zsh
-        Stop timeout: 10s
-        Pre-steps:
-          yarn install --frozen-lockfile
-        Waits for:
-          database: log keyword "ready to accept connections" (case-insensitive), timeout 60s
-      - dashboard [autostart]
-        Run: yarn dev
-        Cwd: /home/user/project/frontend
-        Shell: /bin/zsh
-        Stop timeout: 10s
-        Waits for:
-          api: output idle for 2s, timeout 90s
-    Frontend (1 commands):
-      - worker [manual]
-        Run: node worker.js
-        Cwd: /home/user/project
-        Shell: /bin/zsh
-        Stop timeout: 10s
-```
-
-When pointed at a global list it also shows the global theme, described custom themes, registered aliases, and every referenced project:
+The output includes the project theme, log-buffer size, groups, commands, run commands, working directories, shell, pre-steps, readiness dependencies, shutdown timeout, autostart state, and logfile rotation. When pointed at a global list it also shows the global theme, described custom themes, registered aliases, and every referenced project:
 
 ```sh
 blade --file ~/.blade command list
