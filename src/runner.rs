@@ -26,7 +26,10 @@ use crate::{
         ActionConfig, CommandConfig, ProjectConfig, Readiness, RestartAfter, WaitCondition,
         action_id,
     },
-    log_buffer::{LogBuffer, LogKind, LogLine, LogMetadata, LogUpdate, sanitize_terminal_text},
+    log_buffer::{
+        LogBuffer, LogKind, LogLine, LogMetadata, LogPageAnchor, LogSearchResult, LogUpdate,
+        sanitize_terminal_text,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,16 @@ pub struct RuntimeSnapshot {
     pub stop_level: u8,
     pub stop_deadline: Option<Instant>,
     pub log_metadata: Option<LogMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandStatus {
+    pub id: String,
+    pub name: String,
+    pub state: CommandState,
+    pub pid: Option<i32>,
+    pub exit_code: Option<i32>,
+    pub stop_level: u8,
 }
 
 #[derive(Clone)]
@@ -262,7 +275,15 @@ impl Runner {
     }
 
     pub fn stop(&self, name: &str) -> Result<()> {
-        stop_command(&self.shared, name, false)
+        stop_command(&self.shared, name, None)
+    }
+
+    pub fn terminate(&self, name: &str) -> Result<()> {
+        stop_command(&self.shared, name, Some(2))
+    }
+
+    pub fn kill(&self, name: &str) -> Result<()> {
+        stop_command(&self.shared, name, Some(3))
     }
 
     pub fn force_start(&self, name: &str) -> Result<()> {
@@ -342,7 +363,7 @@ impl Runner {
             .filter(|name| active_names.contains(name))
             .collect();
         for name in names {
-            let _ = stop_command(&self.shared, &name, force);
+            let _ = stop_command(&self.shared, &name, force.then_some(3));
         }
     }
 
@@ -381,6 +402,25 @@ impl Runner {
             .filter(|runtime| matches!(runtime.kind, RuntimeKind::Command))
             .map(|runtime| (*runtime.config).clone())
             .collect()
+    }
+
+    pub fn command_statuses(&self) -> Vec<CommandStatus> {
+        let inner = lock_inner(&self.shared);
+        let mut statuses = inner
+            .runtimes
+            .iter()
+            .filter(|(_, runtime)| matches!(runtime.kind, RuntimeKind::Command))
+            .map(|(id, runtime)| CommandStatus {
+                id: id.clone(),
+                name: runtime.config.name.clone(),
+                state: runtime.state,
+                pid: runtime.pid,
+                exit_code: runtime.exit_code,
+                stop_level: runtime.stop_level,
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        statuses
     }
 
     pub fn add_command(&self, mut config: CommandConfig) -> Result<()> {
@@ -507,16 +547,23 @@ impl Runner {
 
     pub fn snapshot(&self, name: &str) -> Option<RuntimeSnapshot> {
         let inner = lock_inner(&self.shared);
-        inner.runtimes.get(name).map(|runtime| RuntimeSnapshot {
-            state: runtime.state,
-            pid: runtime.pid,
-            exit_code: runtime.exit_code,
-            stop_level: runtime.stop_level,
-            stop_deadline: runtime.stop_deadline,
-            log_metadata: Some(runtime.logs.metadata()),
-        })
+        inner.runtimes.get(name).map(runtime_snapshot)
     }
 
+    pub fn snapshots(&self, names: &[String]) -> HashMap<String, RuntimeSnapshot> {
+        let inner = lock_inner(&self.shared);
+        names
+            .iter()
+            .filter_map(|name| {
+                inner
+                    .runtimes
+                    .get(name)
+                    .map(|runtime| (name.clone(), runtime_snapshot(runtime)))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn logs(&self, name: &str) -> Vec<LogLine> {
         let inner = lock_inner(&self.shared);
         inner
@@ -526,12 +573,58 @@ impl Runner {
             .unwrap_or_default()
     }
 
-    pub fn log_update(&self, name: &str, after: Option<u64>) -> Option<LogUpdate> {
+    pub fn log_tail(&self, name: &str, limit: usize) -> Option<LogUpdate> {
         let inner = lock_inner(&self.shared);
         inner
             .runtimes
             .get(name)
-            .map(|runtime| runtime.logs.update_since(after))
+            .map(|runtime| runtime.logs.tail_update(limit))
+    }
+
+    pub fn log_update_limited(
+        &self,
+        name: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Option<LogUpdate> {
+        let inner = lock_inner(&self.shared);
+        inner
+            .runtimes
+            .get(name)
+            .map(|runtime| runtime.logs.update_since_limited(after, limit))
+    }
+
+    pub fn log_page(
+        &self,
+        name: &str,
+        anchor: LogPageAnchor,
+        through: Option<u64>,
+        limit: usize,
+    ) -> Option<LogUpdate> {
+        let inner = lock_inner(&self.shared);
+        inner
+            .runtimes
+            .get(name)
+            .map(|runtime| runtime.logs.page(anchor, through, limit))
+    }
+
+    pub fn search_logs(
+        &self,
+        name: &str,
+        query: &str,
+        insensitive_regex: bool,
+        from: Option<u64>,
+        backwards: bool,
+        page_limit: usize,
+    ) -> Result<Option<LogSearchResult>> {
+        let inner = lock_inner(&self.shared);
+        let Some(runtime) = inner.runtimes.get(name) else {
+            return Ok(None);
+        };
+        runtime
+            .logs
+            .search(query, insensitive_regex, from, backwards, page_limit)
+            .map_err(Into::into)
     }
 
     pub fn clear_logs(&self, name: &str) -> Result<()> {
@@ -543,6 +636,17 @@ impl Runner {
         runtime.logs.clear();
         self.shared.changed.notify_all();
         Ok(())
+    }
+}
+
+fn runtime_snapshot(runtime: &Runtime) -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        state: runtime.state,
+        pid: runtime.pid,
+        exit_code: runtime.exit_code,
+        stop_level: runtime.stop_level,
+        stop_deadline: runtime.stop_deadline,
+        log_metadata: Some(runtime.logs.metadata()),
     }
 }
 
@@ -706,7 +810,7 @@ fn start_action(shared: &Arc<Shared>, name: &str, kind: RuntimeKind) -> Result<(
             LogKind::System,
             format!("waiting for parent command {parent_id:?} to stop"),
         );
-        stop_command(shared, &parent_id, false)?;
+        stop_command(shared, &parent_id, None)?;
         let shared = Arc::clone(shared);
         let name = name.to_owned();
         thread::Builder::new()
@@ -1269,7 +1373,7 @@ fn readiness_met(runtime: &Runtime, readiness: &Readiness) -> bool {
     }
 }
 
-fn stop_command(shared: &Arc<Shared>, name: &str, force: bool) -> Result<()> {
+fn stop_command(shared: &Arc<Shared>, name: &str, requested_level: Option<u8>) -> Result<()> {
     let (pid, selected_signal, message, escalation) = {
         let mut inner = lock_inner(shared);
         let runtime = inner
@@ -1293,11 +1397,11 @@ fn stop_command(shared: &Arc<Shared>, name: &str, force: bool) -> Result<()> {
         }
 
         let pid = runtime.pid.expect("the pid was checked above");
-        if force {
-            runtime.stop_level = 3;
-        } else {
-            runtime.stop_level = runtime.stop_level.saturating_add(1).min(3);
-        }
+        runtime.stop_level = match requested_level {
+            Some(level) if runtime.stop_level >= level => return Ok(()),
+            Some(level) => level.clamp(1, 3),
+            None => runtime.stop_level.saturating_add(1).min(3),
+        };
         runtime.state = CommandState::Stopping;
         let selected_signal = stop_signal(runtime.stop_level);
         let message = stop_message(runtime.stop_level);
@@ -2470,6 +2574,51 @@ while :; do sleep 0.05; done
 
         assert_eq!(
             runner.snapshot("stubborn service").unwrap().state,
+            CommandState::Stopped
+        );
+    }
+
+    #[test]
+    fn live_status_and_direct_termination_levels_are_available() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+name = "test"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "service"
+stop_timeout = 10
+run = """
+trap '' INT TERM
+while :; do sleep 0.05; done
+"""
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let runner = Runner::new(project);
+        runner.start("service").unwrap();
+        wait_until_running(&runner, "service");
+
+        let status = runner.command_statuses().pop().unwrap();
+        assert_eq!(status.id, "service");
+        assert_eq!(status.name, "service");
+        assert_eq!(status.state, CommandState::Running);
+        assert!(status.pid.is_some());
+
+        runner.terminate("service").unwrap();
+        let snapshot = runner.snapshot("service").unwrap();
+        assert_eq!(snapshot.state, CommandState::Stopping);
+        assert_eq!(snapshot.stop_level, 2);
+
+        runner.kill("service").unwrap();
+        wait_until_inactive(&runner, "service");
+        assert_eq!(
+            runner.snapshot("service").unwrap().state,
             CommandState::Stopped
         );
     }

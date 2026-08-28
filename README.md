@@ -1,10 +1,40 @@
 # Blade
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Blade ("the runner") is a terminal UI for starting and supervising all the commands that make up a project. Commands live in a `.blade` TOML file, are organized into groups, and run through your interactive login shell so shell environment variables, aliases, functions, and builtins remain available.
 
 Blade is Linux/Unix-oriented and currently supports POSIX-compatible user shells such as zsh and bash.
 
 ![Blade supervising a full-stack development project](demo.gif)
+
+## Features
+
+- **Interactive TUI** -- start, stop, restart, and monitor commands in a terminal interface
+- **Dependency management** -- commands wait for readiness conditions (keyword, idle, delay) before starting
+- **Grouped commands** -- organize related commands into named groups
+- **Shell integration** -- runs through your login shell, preserving environment, aliases, and functions
+- **Theme support** -- 17 built-in themes with custom theme and color override support
+- **Ephemeral commands** -- run one-off commands without editing config files
+- **Nested actions** -- maintenance commands (migrations, installs) that inherit parent context
+- **Global project list** -- launch multiple projects in a combined session
+- **Persistent sessions** -- detach, reattach, and reload the TUI without stopping commands
+- **Systemd integration** -- manage system services with lifecycle-aware wrappers
+- **Logging** -- file-based logging with rotation, in-memory ring buffers, incremental live updates, and output dump
+
+## Quick start
+
+```sh
+# Install (requires Rust 1.97+)
+make build && sudo make install
+
+# Create a project config
+cd my-project
+blade init
+
+# Start the TUI
+blade
+```
 
 ## Documentation
 
@@ -56,14 +86,28 @@ Run the interactive initializer in the project directory:
 blade init
 blade validate
 blade
+blade run                 # explicit subcommand (same as running blade with no subcommand)
 blade --global            # skip the local .blade and open the global picker
 blade --all               # start every command, overriding autostart settings
+blade sessions            # list running sessions and their ids
 blade attach              # reconnect to the only detached session
+blade shutdown            # gracefully stop the only running session
 blade command list        # show the discovered configuration clearly
+blade command list --session  # show commands in the running session
+blade command restart api     # control the only running session
 blade command add         # interactively append a command
 ```
 
 Blade searches the current directory and its parents for `.blade`, so it can be launched from a nested source directory. Use `blade --file path/to/config` to select one explicitly, or `blade --global` to skip local discovery and open the global project picker. When no project file is found, Blade reads `~/.blade`, `~/.config/blade.config`, or `~/.config/blade.conf` and opens that picker automatically. The global list may also define the fallback theme, custom inline or file-referenced themes, and the theme used for an **All projects** session; see [Global project list](docs/projects.md) and [Themes](docs/themes.md#custom-global-themes). An existing project config is never overwritten by `blade init` without confirmation (or an explicit `--force`).
+
+The `run` subcommand is the explicit form of the default action. It accepts the same startup options:
+
+```sh
+blade run                 # start the TUI with normal autostart behavior
+blade run --global        # open the global project picker
+blade run --all           # start every command regardless of autostart
+blade run --no-autostart  # open without starting anything
+```
 
 Normally Blade starts only commands with `autostart = true`. Use `--all` (also available as `--start-all`) to start every command when the TUI opens, regardless of its configured `autostart` value. Use `--no-autostart` to open without starting anything.
 
@@ -162,10 +206,13 @@ Press `f` while a command is waiting to bypass all of its remaining readiness co
 
 | Key | Action |
 | --- | --- |
+| Mouse / touch | Click a command or output line to select it; scroll the pane under the pointer |
 | `Tab` | Switch focus between commands and output |
 | `→`, `←` | Focus panes while wrapping is on; scroll horizontally while it is off (`←` returns to commands from the left edge) |
 | `↑`/`↓`, `j`/`k` | Select a group, command, or output line |
 | `Ctrl-P` | Open Quick jump and fuzzy-find a command or nested action to focus |
+| `+`, `-` | Expand or collapse the selected project, group, or command |
+| `Ctrl++`, `Ctrl+-` | Expand or collapse the whole tree (`Ctrl+=` and `Ctrl+_` are terminal-friendly aliases) |
 | `:` | Run a one-off command in the selected project context and add it to the Ephemeral group |
 | `;` | Fork a command/action, or edit an ephemeral command in place |
 | `p`, `D` | Persist the selected ephemeral command to a project, or remove it once stopped |
@@ -182,9 +229,9 @@ Press `f` while a command is waiting to bypass all of its remaining readiness co
 | `n`/`N` | Select the next/previous search match |
 | `t` | Toggle timestamps (enabled by default) |
 | `T` | Preview themes and save the selected preset or custom-theme file reference |
-| `y`, `Y` | Copy the selected line or all output with `xclip` (expires after two minutes) |
+| `y`, `Y` | Copy the selected line or stream all output to `xclip` (expires after two minutes) |
 | `c` | Clear the selected command's in-memory output pane without truncating its logfile |
-| `d` | Dump all output to a new file (existing files are not overwritten) |
+| `d` | Stream all output to a new file (existing files are not overwritten) |
 | `Q` | Confirm detaching the TUI while the supervisor and commands keep running |
 | `R` | Confirm restarting the on-disk Blade TUI binary and reattaching to the same session |
 | `q`, `Ctrl-C` | Confirm gracefully stopping everything and quitting; repeat and confirm to force quit |
@@ -194,9 +241,15 @@ Start, stop, restart, quit, detach, and restart-and-reattach open a confirmation
 
 The layout changes automatically: wide terminals use side-by-side panes, narrow terminals stack commands above output, and terminal resize events are handled immediately. Scrollable Commands, Output, and management views show a themed vertical track with direction arrows and a position thumb whenever content exceeds the viewport.
 
+The supervisor owns complete in-memory log rings. The TUI keeps a small live tail and fetches older or newer output in 256-line pages as navigation approaches an unloaded edge. Searches run against the supervisor's complete ring and return only a page around the matching sequence. Copy-all and dump stream a fixed snapshot in the background instead of constructing the complete output in the TUI.
+
+Other applications can control the same supervisor without opening another TUI. `blade command list --session` reports live state, `--json` provides structured output, and `blade command start|stop|restart|terminate|kill COMMAND` changes the selected runtime. Add `--session ID` when more than one session exists. Attached clients show the resulting state on their next refresh. Use `blade shutdown [SESSION]` to gracefully end a complete session, or add `--force` to kill its process groups immediately.
+
 Nested actions and ephemeral commands use the same process supervision, output pane, search, restart, stop escalation, and shutdown cleanup as configured commands. Actions retain independent logs and are not included in autostart or `--all`; see [Command actions](docs/actions.md).
 
-The TUI is a client of a per-project supervisor process. Detaching or reloading closes only that client; running commands, ephemeral scratchpads, runtime state, and in-memory logs remain available to the next client. See [Sessions, detaching, and live reload](docs/sessions.md).
+The TUI is a client of a per-session supervisor process. A normal project invocation creates one session for that project; an **All projects** invocation creates one combined session and supervisor for the selected project set. Detaching or reloading closes only that client; running commands, ephemeral scratchpads, runtime state, and in-memory logs remain available to the next client. See [Sessions, detaching, and live reload](docs/sessions.md).
+
+Blade 1.0 treats the current feature-complete supervisor wire format as protocol 1. Handshakes advertise explicit capabilities so future frontends can remain compatible with older supervisors and degrade individual features instead of rejecting an otherwise usable session.
 
 ## Validation
 
@@ -212,3 +265,13 @@ Validation catches malformed TOML, wrong field types, unsupported versions, dupl
 The first confirmed stop sends `SIGINT` to the command's process group. Repeating and confirming stop sends `SIGTERM`, then `SIGKILL`. If no repeated key is pressed, Blade automatically escalates after `stop_timeout` so a stuck process cannot keep shutdown open forever. The project-level value defaults to 10 seconds and each command may override it. The timeout applies to each escalation stage, and the output title shows a countdown to the next signal.
 
 Confirmed quit applies the same graceful stop to every active command. Pressing quit again and confirming immediately force-kills all remaining process groups. Blade restores the terminal before returning control to the shell.
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request at [github.com/adnanh/blade](https://github.com/adnanh/blade).
+
+## License
+
+The MIT License (MIT)
+
+Copyright (c) 2026 Adnan Hajdarevic

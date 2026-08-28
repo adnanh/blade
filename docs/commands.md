@@ -10,13 +10,72 @@ Display the discovered local project in a readable form:
 blade command list
 ```
 
-The output includes the project theme, log-buffer size, groups, commands, run commands, working directories, shell, pre-steps, readiness dependencies, shutdown timeout, autostart state, and logfile rotation. When pointed at a global list it also shows the global theme, described custom themes, registered aliases, and every referenced project:
+The output includes the project theme, log-buffer size, groups, commands, run commands, working directories, shell, pre-steps, readiness dependencies, shutdown timeout, autostart state, and logfile rotation. For example:
+
+```
+Project: My app
+  File: /home/user/project/.blade
+  Theme: nord
+  Max log lines: 100000
+  Groups: 2
+    Project (2 commands):
+      - api [autostart]
+        Run: yarn dev:api
+        Cwd: /home/user/project
+        Shell: /bin/zsh
+        Stop timeout: 10s
+        Pre-steps:
+          yarn install --frozen-lockfile
+        Waits for:
+          database: log keyword "ready to accept connections" (case-insensitive), timeout 60s
+      - dashboard [autostart]
+        Run: yarn dev
+        Cwd: /home/user/project/frontend
+        Shell: /bin/zsh
+        Stop timeout: 10s
+        Waits for:
+          api: output idle for 2s, timeout 90s
+    Frontend (1 commands):
+      - worker [manual]
+        Run: node worker.js
+        Cwd: /home/user/project
+        Shell: /bin/zsh
+        Stop timeout: 10s
+```
+
+When pointed at a global list it also shows the global theme, described custom themes, registered aliases, and every referenced project:
 
 ```sh
 blade --file ~/.blade command list
 blade --file ~/.config/blade.conf command list
 blade --file ~/.blade command list --project "ACME Development"
 ```
+
+## Controlling a running session
+
+List the commands owned by the only running Blade supervisor, or select a session by id or project name:
+
+```sh
+blade command list --session
+blade command list --session abc123
+blade command list --session abc123 --json
+```
+
+The text output includes each command's state, selector, process id, exit code, and internal id. JSON output also includes its project, group, ephemeral flag, and current stop level. In a combined session, selectors use `Project::command`; an unqualified name works only when it identifies one command uniquely.
+
+Use the selector, command name, or exact id to control it:
+
+```sh
+blade command start api
+blade command stop api
+blade command restart Backend::api --session abc123
+blade command terminate worker
+blade command kill stuck-worker
+```
+
+With no `--session`, Blade targets the only running session and reports an error if the choice is ambiguous. `stop` begins the normal `SIGINT` and timeout escalation sequence. `terminate` starts at `SIGTERM` and escalates to `SIGKILL` after the configured stop timeout; `kill` sends `SIGKILL` immediately. The command exits nonzero if the session or target cannot be resolved or the supervisor rejects the operation.
+
+All operations use the same supervisor state as attached TUIs. Existing clients display the new state on their next refresh (normally within 75 ms), and lifecycle requests are recorded in that command's system output.
 
 ## Interactive usage
 
@@ -72,6 +131,10 @@ Press `M` to open **Manage configured commands and actions**. This screen edits 
 
 Commands are displayed hierarchically under their project and group, with actions nested beneath their parent command, matching the structure of the Commands pane.
 
+In the main Commands pane, `+` and `-` expand or collapse the selected project, group, or command. `Ctrl++` and `Ctrl+-` expand or collapse the entire tree; `Ctrl+=` and `Ctrl+_` work as aliases for terminals that report the shifted keys differently. Quick jump searches collapsed descendants too and expands their ancestors when selected.
+
+Mouse-enabled terminals can select any visible project, group, command, action, or output line by clicking it. The scroll wheel navigates whichever pane is under the pointer; touch input works when the terminal translates taps and gestures into mouse events.
+
 | Key | Action |
 | --- | --- |
 | `c` | Add a command |
@@ -82,7 +145,7 @@ Commands are displayed hierarchically under their project and group, with action
 | `d` | Delete after confirmation |
 | `Esc` | Close the manager or cancel the current form |
 
-The command form supports the command name, run command, working directory, project, and group. The action form supports name, run command, an optional inherited-directory override, parent command, stopped-parent requirement, and restart policy. Editable rows are labeled `[type]`, long values wrap within the popup, and the selected text row shows a movable `█` cursor. `Tab` selects a field. In text fields, left/right moves by character, Home/End jumps to an edge, Backspace removes the preceding character, and Delete removes the following character. Choice fields use left/right; the stopped-parent field also accepts Space.
+The command form supports the command name, run command, working directory, project, and group. The action form supports name, run command, an optional inherited-directory override, parent command, stopped-parent requirement, and restart policy. Editable rows are labeled `[type]`, long values wrap within the popup, and the selected text row shows a movable inverted cursor without shifting its character. `Tab` selects a field. In text fields, left/right moves by character, Home/End jumps to an edge, Backspace removes the preceding character, and Delete removes the following character. Choice fields use left/right; the stopped-parent field also accepts Space.
 
 If Apply fails because required fields are empty or the proposed configuration is invalid, Blade shows the full error in a modal popup and leaves the form intact. Press `Enter` or `Esc` to return; for missing fields, the cursor moves to the first one.
 

@@ -31,6 +31,20 @@ pub struct LogUpdate {
     pub lines: Vec<LogLine>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "anchor", rename_all = "kebab-case")]
+pub enum LogPageAnchor {
+    Before { sequence: u64 },
+    After { sequence: Option<u64> },
+    Around { sequence: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogSearchResult {
+    pub sequence: u64,
+    pub page: LogUpdate,
+}
+
 impl LogLine {
     pub fn display(&self, timestamps: bool) -> String {
         let prefix = if timestamps {
@@ -89,6 +103,7 @@ impl LogBuffer {
         line
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Vec<LogLine> {
         self.lines.iter().cloned().collect()
     }
@@ -101,17 +116,134 @@ impl LogBuffer {
         }
     }
 
-    pub fn update_since(&self, after: Option<u64>) -> LogUpdate {
-        let lines = self
+    pub fn tail_update(&self, limit: usize) -> LogUpdate {
+        self.update_since_limited(None, limit)
+    }
+
+    pub fn update_since_limited(&self, after: Option<u64>, limit: usize) -> LogUpdate {
+        let mut lines = self
             .lines
             .iter()
             .filter(|line| after.is_none_or(|sequence| line.sequence > sequence))
+            .rev()
+            .take(limit)
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        lines.reverse();
         LogUpdate {
             metadata: self.metadata(),
             lines,
         }
+    }
+
+    pub fn page(&self, anchor: LogPageAnchor, through: Option<u64>, limit: usize) -> LogUpdate {
+        let within_snapshot =
+            |line: &&LogLine| through.is_none_or(|last_sequence| line.sequence <= last_sequence);
+        let lines = match anchor {
+            LogPageAnchor::Before { sequence } => {
+                let mut lines = self
+                    .lines
+                    .iter()
+                    .filter(within_snapshot)
+                    .filter(|line| line.sequence < sequence)
+                    .rev()
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                lines.reverse();
+                lines
+            }
+            LogPageAnchor::After { sequence } => self
+                .lines
+                .iter()
+                .filter(within_snapshot)
+                .filter(|line| sequence.is_none_or(|sequence| line.sequence > sequence))
+                .take(limit)
+                .cloned()
+                .collect(),
+            LogPageAnchor::Around { sequence } => {
+                let available_len = through
+                    .and_then(|last_sequence| {
+                        self.lines
+                            .iter()
+                            .rposition(|line| line.sequence <= last_sequence)
+                            .map(|position| position + 1)
+                    })
+                    .unwrap_or(self.lines.len());
+                let Some(position) = self
+                    .lines
+                    .iter()
+                    .take(available_len)
+                    .position(|line| line.sequence == sequence)
+                else {
+                    return LogUpdate {
+                        metadata: self.metadata(),
+                        lines: Vec::new(),
+                    };
+                };
+                let start = position
+                    .saturating_sub(limit / 2)
+                    .min(available_len.saturating_sub(limit));
+                self.lines
+                    .iter()
+                    .skip(start)
+                    .take(limit.min(available_len.saturating_sub(start)))
+                    .cloned()
+                    .collect()
+            }
+        };
+        LogUpdate {
+            metadata: self.metadata(),
+            lines,
+        }
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        insensitive_regex: bool,
+        from: Option<u64>,
+        backwards: bool,
+        page_limit: usize,
+    ) -> Result<Option<LogSearchResult>, regex::Error> {
+        let regex = if insensitive_regex {
+            regex::RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()?
+        } else {
+            regex::Regex::new(&regex::escape(query))?
+        };
+        let found = if backwards {
+            self.lines
+                .iter()
+                .rev()
+                .find(|line| {
+                    from.is_none_or(|from| line.sequence < from) && regex.is_match(&line.text)
+                })
+                .or_else(|| {
+                    self.lines
+                        .iter()
+                        .rev()
+                        .find(|line| regex.is_match(&line.text))
+                })
+        } else {
+            self.lines
+                .iter()
+                .find(|line| {
+                    from.is_none_or(|from| line.sequence > from) && regex.is_match(&line.text)
+                })
+                .or_else(|| self.lines.iter().find(|line| regex.is_match(&line.text)))
+        };
+        Ok(found.map(|line| LogSearchResult {
+            sequence: line.sequence,
+            page: self.page(
+                LogPageAnchor::Around {
+                    sequence: line.sequence,
+                },
+                None,
+                page_limit,
+            ),
+        }))
     }
 
     pub fn clear(&mut self) {
@@ -134,7 +266,7 @@ pub fn sanitize_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogBuffer, LogKind, sanitize_terminal_text};
+    use super::{LogBuffer, LogKind, LogPageAnchor, sanitize_terminal_text};
 
     #[test]
     fn evicts_oldest_lines_at_capacity() {
@@ -171,7 +303,7 @@ mod tests {
         let first = buffer.push(LogKind::Output, "one");
         let second = buffer.push(LogKind::Output, "two");
 
-        let initial = buffer.update_since(None);
+        let initial = buffer.update_since_limited(None, usize::MAX);
         assert_eq!(initial.metadata.count, 2);
         assert_eq!(initial.metadata.first_sequence, Some(first.sequence));
         assert_eq!(initial.metadata.last_sequence, Some(second.sequence));
@@ -179,7 +311,7 @@ mod tests {
 
         buffer.push(LogKind::Output, "three");
         let fourth = buffer.push(LogKind::Output, "four");
-        let update = buffer.update_since(Some(second.sequence));
+        let update = buffer.update_since_limited(Some(second.sequence), usize::MAX);
         assert_eq!(update.metadata.count, 3);
         assert_eq!(update.metadata.first_sequence, Some(second.sequence));
         assert_eq!(update.metadata.last_sequence, Some(fourth.sequence));
@@ -191,5 +323,123 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["three", "four"]
         );
+    }
+
+    #[test]
+    fn tail_updates_bound_initial_history_without_losing_metadata() {
+        let mut buffer = LogBuffer::new(5);
+        for text in ["one", "two", "three", "four"] {
+            buffer.push(LogKind::Output, text);
+        }
+
+        let update = buffer.tail_update(2);
+        assert_eq!(update.metadata.count, 4);
+        assert_eq!(
+            update
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["three", "four"]
+        );
+
+        let third = buffer.snapshot()[2].sequence;
+        buffer.push(LogKind::Output, "five");
+        buffer.push(LogKind::Output, "six");
+        buffer.push(LogKind::Output, "seven");
+        let update = buffer.update_since_limited(Some(third), 2);
+        assert_eq!(update.metadata.count, 5);
+        assert_eq!(
+            update
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["six", "seven"]
+        );
+    }
+
+    #[test]
+    fn pages_before_after_and_around_sequence_cursors() {
+        let mut buffer = LogBuffer::new(20);
+        let sequences = (0..10)
+            .map(|index| buffer.push(LogKind::Output, index.to_string()).sequence)
+            .collect::<Vec<_>>();
+
+        let before = buffer.page(
+            LogPageAnchor::Before {
+                sequence: sequences[5],
+            },
+            None,
+            2,
+        );
+        assert_eq!(
+            before
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "4"]
+        );
+
+        let after = buffer.page(
+            LogPageAnchor::After {
+                sequence: Some(sequences[4]),
+            },
+            Some(sequences[6]),
+            5,
+        );
+        assert_eq!(
+            after
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["5", "6"]
+        );
+
+        let around = buffer.page(
+            LogPageAnchor::Around {
+                sequence: sequences[8],
+            },
+            None,
+            5,
+        );
+        assert_eq!(
+            around
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["5", "6", "7", "8", "9"]
+        );
+    }
+
+    #[test]
+    fn searches_wrap_by_sequence_and_return_a_page_around_the_match() {
+        let mut buffer = LogBuffer::new(20);
+        let first = buffer.push(LogKind::Output, "Needle one");
+        let second = buffer.push(LogKind::Output, "other");
+        let third = buffer.push(LogKind::Output, "needle two");
+
+        let exact = buffer
+            .search("Needle", false, Some(third.sequence), false, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.sequence, first.sequence);
+        assert!(
+            exact
+                .page
+                .lines
+                .iter()
+                .any(|line| line.sequence == exact.sequence)
+        );
+
+        let backwards = buffer
+            .search("n.edle", true, Some(first.sequence), true, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(backwards.sequence, third.sequence);
+        assert_ne!(backwards.sequence, second.sequence);
     }
 }

@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
@@ -22,12 +22,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{CommandConfig, ProjectConfig},
-    log_buffer::{LogLine, LogMetadata, LogUpdate},
-    runner::{CommandState, Runner, RuntimeSnapshot},
+    log_buffer::{LogMetadata, LogPageAnchor, LogSearchResult, LogUpdate},
+    runner::{CommandState, CommandStatus, Runner, RuntimeSnapshot},
 };
 
+// Protocol 1 is the first public wire format. When adding a later protocol,
+// keep the oldest compatible version here and gate new requests by capability.
+const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 const PROTOCOL_VERSION: u32 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOG_EXPORT_PAGE_LINES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProtocolCapability {
+    BatchedSnapshots,
+    BoundedLogUpdates,
+    LogPaging,
+    LogSearch,
+    LogDump,
+    CommandStatuses,
+    DirectSignals,
+    SessionShutdown,
+}
+
+fn protocol_capabilities() -> Vec<ProtocolCapability> {
+    vec![
+        ProtocolCapability::BatchedSnapshots,
+        ProtocolCapability::BoundedLogUpdates,
+        ProtocolCapability::LogPaging,
+        ProtocolCapability::LogSearch,
+        ProtocolCapability::LogDump,
+        ProtocolCapability::CommandStatuses,
+        ProtocolCapability::DirectSignals,
+        ProtocolCapability::SessionShutdown,
+    ]
+}
+
+fn protocol_is_supported(protocol: u32) -> bool {
+    (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogExport {
+    pub lines: usize,
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProject {
@@ -115,6 +155,26 @@ impl RunnerHandle {
         }
     }
 
+    pub fn terminate(&self, id: &str) -> Result<()> {
+        match self {
+            Self::Local(runner) => runner.terminate(id),
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::DirectSignals, "direct termination")?;
+                client.call_ok(&Request::Terminate { id: id.to_owned() })
+            }
+        }
+    }
+
+    pub fn kill(&self, id: &str) -> Result<()> {
+        match self {
+            Self::Local(runner) => runner.kill(id),
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::DirectSignals, "direct kill")?;
+                client.call_ok(&Request::Kill { id: id.to_owned() })
+            }
+        }
+    }
+
     pub fn force_start(&self, id: &str) -> Result<()> {
         match self {
             Self::Local(runner) => runner.force_start(id),
@@ -145,17 +205,17 @@ impl RunnerHandle {
         }
     }
 
-    pub fn active_command_count(&self) -> usize {
+    pub fn command_statuses(&self) -> Result<Vec<CommandStatus>> {
         match self {
-            Self::Local(runner) => runner.active_command_count(),
-            Self::Remote(client) => client.call_count(&Request::ActiveCommandCount),
-        }
-    }
-
-    pub fn command_count(&self) -> usize {
-        match self {
-            Self::Local(runner) => runner.command_count(),
-            Self::Remote(client) => client.call_count(&Request::CommandCount),
+            Self::Local(runner) => Ok(runner.command_statuses()),
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::CommandStatuses, "live command status")?;
+                match client.call(&Request::CommandStatuses)? {
+                    Response::CommandStatuses(statuses) => Ok(statuses),
+                    Response::Error { message } => Err(anyhow!(message)),
+                    response => bail!("unexpected response from Blade supervisor: {response:?}"),
+                }
+            }
         }
     }
 
@@ -216,26 +276,207 @@ impl RunnerHandle {
         }
     }
 
-    pub fn logs(&self, id: &str) -> Vec<LogLine> {
+    pub fn snapshots(&self, ids: &[String]) -> Result<HashMap<String, RuntimeSnapshot>> {
         match self {
-            Self::Local(runner) => runner.logs(id),
-            Self::Remote(client) => match client.call(&Request::Logs { id: id.to_owned() }) {
-                Ok(Response::Logs(logs)) => logs,
-                _ => Vec::new(),
-            },
+            Self::Local(runner) => Ok(runner.snapshots(ids)),
+            Self::Remote(client) if client.supports(ProtocolCapability::BatchedSnapshots) => {
+                match client.call(&Request::Snapshots { ids: ids.to_vec() }) {
+                    Ok(Response::Snapshots(snapshots)) => Ok(snapshots
+                        .into_iter()
+                        .map(|(id, snapshot)| (id, snapshot.into_runtime()))
+                        .collect()),
+                    Ok(Response::Error { message }) => Err(anyhow!(message)),
+                    Ok(response) => {
+                        bail!("unexpected response from Blade supervisor: {response:?}")
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Self::Remote(client) => {
+                let mut snapshots = HashMap::new();
+                if ids.is_empty() {
+                    return match client.call(&Request::Ping)? {
+                        Response::Pong { .. } => Ok(snapshots),
+                        Response::Error { message } => Err(anyhow!(message)),
+                        response => {
+                            bail!("unexpected response from Blade supervisor: {response:?}")
+                        }
+                    };
+                }
+                for id in ids {
+                    match client.call(&Request::Snapshot { id: id.clone() })? {
+                        Response::Snapshot(Some(snapshot)) => {
+                            snapshots.insert(id.clone(), snapshot.into_runtime());
+                        }
+                        Response::Snapshot(None) => {}
+                        Response::Error { message } => return Err(anyhow!(message)),
+                        response => {
+                            bail!("unexpected response from Blade supervisor: {response:?}")
+                        }
+                    }
+                }
+                Ok(snapshots)
+            }
         }
     }
 
-    pub fn log_update(&self, id: &str, after: Option<u64>) -> Option<LogUpdate> {
+    pub fn log_tail(&self, id: &str, limit: usize) -> Option<LogUpdate> {
         match self {
-            Self::Local(runner) => runner.log_update(id, after),
-            Self::Remote(client) => match client.call(&Request::LogUpdate {
-                id: id.to_owned(),
-                after,
-            }) {
-                Ok(Response::LogUpdate(update)) => update,
-                _ => None,
-            },
+            Self::Local(runner) => runner.log_tail(id, limit),
+            Self::Remote(client) if client.supports(ProtocolCapability::BoundedLogUpdates) => {
+                match client.call(&Request::LogUpdate {
+                    id: id.to_owned(),
+                    after: None,
+                    limit,
+                }) {
+                    Ok(Response::LogUpdate(update)) => update,
+                    _ => None,
+                }
+            }
+            Self::Remote(_) => None,
+        }
+    }
+
+    pub fn log_update_limited(
+        &self,
+        id: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Option<LogUpdate> {
+        match self {
+            Self::Local(runner) => runner.log_update_limited(id, after, limit),
+            Self::Remote(client) if client.supports(ProtocolCapability::BoundedLogUpdates) => {
+                match client.call(&Request::LogUpdate {
+                    id: id.to_owned(),
+                    after,
+                    limit,
+                }) {
+                    Ok(Response::LogUpdate(update)) => update,
+                    _ => None,
+                }
+            }
+            Self::Remote(_) => None,
+        }
+    }
+
+    pub fn log_page(
+        &self,
+        id: &str,
+        anchor: LogPageAnchor,
+        through: Option<u64>,
+        limit: usize,
+    ) -> Result<Option<LogUpdate>> {
+        match self {
+            Self::Local(runner) => Ok(runner.log_page(id, anchor, through, limit)),
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::LogPaging, "log history paging")?;
+                match client.call(&Request::LogPage {
+                    id: id.to_owned(),
+                    anchor,
+                    through,
+                    limit,
+                })? {
+                    Response::LogPage(page) => Ok(page),
+                    Response::Error { message } => Err(anyhow!(message)),
+                    response => bail!("unexpected response from Blade supervisor: {response:?}"),
+                }
+            }
+        }
+    }
+
+    pub fn search_logs(
+        &self,
+        id: &str,
+        query: &str,
+        insensitive_regex: bool,
+        from: Option<u64>,
+        backwards: bool,
+        page_limit: usize,
+    ) -> Result<Option<LogSearchResult>> {
+        match self {
+            Self::Local(runner) => {
+                runner.search_logs(id, query, insensitive_regex, from, backwards, page_limit)
+            }
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::LogSearch, "supervisor log search")?;
+                match client.call(&Request::SearchLogs {
+                    id: id.to_owned(),
+                    query: query.to_owned(),
+                    insensitive_regex,
+                    from,
+                    backwards,
+                    page_limit,
+                })? {
+                    Response::LogSearch(result) => Ok(result),
+                    Response::Error { message } => Err(anyhow!(message)),
+                    response => bail!("unexpected response from Blade supervisor: {response:?}"),
+                }
+            }
+        }
+    }
+
+    pub fn stream_logs<W: Write>(
+        &self,
+        id: &str,
+        timestamps: bool,
+        writer: &mut W,
+    ) -> Result<LogExport> {
+        let mut after = None;
+        let mut through = None;
+        let mut expected = None;
+        let mut lines = 0;
+        let mut truncated = false;
+
+        loop {
+            let Some(page) = self.log_page(
+                id,
+                LogPageAnchor::After { sequence: after },
+                through,
+                LOG_EXPORT_PAGE_LINES,
+            )?
+            else {
+                bail!("unknown command {id:?}");
+            };
+            if through.is_none() {
+                through = page.metadata.last_sequence;
+                expected = page.metadata.first_sequence;
+            }
+            if page.lines.is_empty() {
+                truncated |= after != through;
+                break;
+            }
+            for line in page.lines {
+                if expected.is_some_and(|sequence| sequence != line.sequence) {
+                    truncated = true;
+                }
+                writer.write_all(line.display(timestamps).as_bytes())?;
+                writer.write_all(b"\n")?;
+                expected = Some(line.sequence.wrapping_add(1));
+                after = Some(line.sequence);
+                lines += 1;
+            }
+            if after == through {
+                break;
+            }
+        }
+        Ok(LogExport { lines, truncated })
+    }
+
+    pub fn dump_logs(&self, id: &str, path: &Path, timestamps: bool) -> Result<LogExport> {
+        match self {
+            Self::Local(_) => dump_logs_from_handle(self, id, path, timestamps),
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::LogDump, "supervisor log dump")?;
+                match client.call(&Request::DumpLogs {
+                    id: id.to_owned(),
+                    path: path.to_owned(),
+                    timestamps,
+                })? {
+                    Response::LogExport(export) => Ok(export),
+                    Response::Error { message } => Err(anyhow!(message)),
+                    response => bail!("unexpected response from Blade supervisor: {response:?}"),
+                }
+            }
         }
     }
 
@@ -285,8 +526,32 @@ impl RunnerHandle {
         }
     }
 
+    pub fn shutdown_session(&self, force: bool) -> Result<()> {
+        match self {
+            Self::Local(runner) => {
+                runner.shutdown(force);
+                Ok(())
+            }
+            Self::Remote(client) => {
+                client.require(ProtocolCapability::SessionShutdown, "session shutdown")?;
+                client.call_ok(&Request::ShutdownSession { force })
+            }
+        }
+    }
+
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::Remote(_))
+    }
+
+    pub fn background_handle(&self) -> Result<Self> {
+        match self {
+            Self::Local(runner) => Ok(Self::Local(runner.clone())),
+            Self::Remote(client) => Ok(Self::Remote(SupervisorClient::connect(
+                client.inner.project.as_ref().clone(),
+                client.inner.descriptor.clone(),
+                None,
+            )?)),
+        }
     }
 }
 
@@ -299,6 +564,8 @@ struct ClientInner {
     project: Arc<ProjectConfig>,
     descriptor: SessionDescriptor,
     executable: PathBuf,
+    protocol: u32,
+    capabilities: HashSet<ProtocolCapability>,
     connection: Mutex<BufReader<UnixStream>>,
     child: Mutex<Option<Child>>,
 }
@@ -317,23 +584,48 @@ impl SupervisorClient {
                 descriptor.socket.display()
             )
         })?;
-        let client = Self {
+        let descriptor_protocol = descriptor.protocol;
+        let mut client = Self {
             inner: Arc::new(ClientInner {
                 project: Arc::new(project),
                 descriptor,
                 executable,
+                protocol: descriptor_protocol,
+                capabilities: HashSet::new(),
                 connection: Mutex::new(BufReader::new(stream)),
                 child: Mutex::new(child),
             }),
         };
         match client.call(&Request::Ping)? {
             Response::Pong {
-                protocol: PROTOCOL_VERSION,
-            } => Ok(client),
-            Response::Pong { protocol } => bail!(
-                "Blade session protocol {protocol} is incompatible with client protocol {PROTOCOL_VERSION}"
+                protocol,
+                capabilities,
+            } if protocol_is_supported(protocol) => {
+                let inner = Arc::get_mut(&mut client.inner)
+                    .expect("new supervisor client must have unique state");
+                inner.protocol = protocol;
+                inner.capabilities = capabilities.into_iter().collect();
+                Ok(client)
+            }
+            Response::Pong { protocol, .. } => bail!(
+                "Blade session protocol {protocol} is incompatible; this client supports protocols {MIN_SUPPORTED_PROTOCOL_VERSION} through {PROTOCOL_VERSION}"
             ),
             response => bail!("unexpected response from Blade supervisor: {response:?}"),
+        }
+    }
+
+    fn supports(&self, capability: ProtocolCapability) -> bool {
+        self.inner.capabilities.contains(&capability)
+    }
+
+    fn require(&self, capability: ProtocolCapability, feature: &str) -> Result<()> {
+        if self.supports(capability) {
+            Ok(())
+        } else {
+            bail!(
+                "{feature} is unavailable in Blade supervisor protocol {}",
+                self.inner.protocol
+            )
         }
     }
 
@@ -386,25 +678,84 @@ enum Request {
     Ping,
     Autostart,
     StartAll,
-    Start { id: String },
-    Stop { id: String },
-    ForceStart { id: String },
-    Restart { id: String },
-    Shutdown { force: bool },
+    Start {
+        id: String,
+    },
+    Stop {
+        id: String,
+    },
+    Terminate {
+        id: String,
+    },
+    Kill {
+        id: String,
+    },
+    ForceStart {
+        id: String,
+    },
+    Restart {
+        id: String,
+    },
+    Shutdown {
+        force: bool,
+    },
     ActiveCount,
     ActiveCommandCount,
     CommandCount,
+    CommandStatuses,
     ConfiguredCommands,
-    AddCommand { config: CommandConfig },
-    AddEphemeral { state: EphemeralState },
-    UpdateCommand { config: CommandConfig },
-    RemoveCommand { id: String },
-    MarkEphemeralPersisted { id: String },
-    Snapshot { id: String },
-    Logs { id: String },
-    LogUpdate { id: String, after: Option<u64> },
-    ClearLogs { id: String },
+    AddCommand {
+        config: CommandConfig,
+    },
+    AddEphemeral {
+        state: EphemeralState,
+    },
+    UpdateCommand {
+        config: CommandConfig,
+    },
+    RemoveCommand {
+        id: String,
+    },
+    MarkEphemeralPersisted {
+        id: String,
+    },
+    Snapshot {
+        id: String,
+    },
+    Snapshots {
+        ids: Vec<String>,
+    },
+    LogUpdate {
+        id: String,
+        after: Option<u64>,
+        limit: usize,
+    },
+    LogPage {
+        id: String,
+        anchor: LogPageAnchor,
+        through: Option<u64>,
+        limit: usize,
+    },
+    SearchLogs {
+        id: String,
+        query: String,
+        insensitive_regex: bool,
+        from: Option<u64>,
+        backwards: bool,
+        page_limit: usize,
+    },
+    DumpLogs {
+        id: String,
+        path: PathBuf,
+        timestamps: bool,
+    },
+    ClearLogs {
+        id: String,
+    },
     Ephemerals,
+    ShutdownSession {
+        force: bool,
+    },
     TerminateSession,
 }
 
@@ -412,14 +763,24 @@ enum Request {
 #[serde(tag = "result", content = "data", rename_all = "kebab-case")]
 enum Response {
     Ok,
-    Error { message: String },
-    Pong { protocol: u32 },
+    Error {
+        message: String,
+    },
+    Pong {
+        protocol: u32,
+        #[serde(default)]
+        capabilities: Vec<ProtocolCapability>,
+    },
     Count(usize),
     Snapshot(Option<RuntimeSnapshotWire>),
-    Logs(Vec<LogLine>),
+    Snapshots(HashMap<String, RuntimeSnapshotWire>),
     LogUpdate(Option<LogUpdate>),
+    LogPage(Option<LogUpdate>),
+    LogSearch(Option<LogSearchResult>),
+    LogExport(LogExport),
     Ephemerals(Vec<EphemeralState>),
     Commands(Vec<CommandConfig>),
+    CommandStatuses(Vec<CommandStatus>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -469,13 +830,30 @@ struct ServerState {
     ephemerals: Mutex<HashMap<String, EphemeralState>>,
     terminate: AtomicBool,
     terminate_ready: AtomicBool,
+    shutdown_when_idle: AtomicBool,
 }
 
 impl ServerState {
     fn respond(&self, request: Request) -> Response {
+        if self.shutdown_when_idle.load(Ordering::Acquire)
+            && matches!(
+                &request,
+                Request::Autostart
+                    | Request::StartAll
+                    | Request::Start { .. }
+                    | Request::ForceStart { .. }
+                    | Request::Restart { .. }
+                    | Request::AddEphemeral { .. }
+            )
+        {
+            return Response::Error {
+                message: "Blade session is shutting down".to_owned(),
+            };
+        }
         match request {
             Request::Ping => Response::Pong {
                 protocol: PROTOCOL_VERSION,
+                capabilities: protocol_capabilities(),
             },
             Request::Autostart => {
                 self.runner.autostart();
@@ -487,6 +865,8 @@ impl ServerState {
             }
             Request::Start { id } => result_response(self.runner.start(&id)),
             Request::Stop { id } => result_response(self.runner.stop(&id)),
+            Request::Terminate { id } => result_response(self.runner.terminate(&id)),
+            Request::Kill { id } => result_response(self.runner.kill(&id)),
             Request::ForceStart { id } => result_response(self.runner.force_start(&id)),
             Request::Restart { id } => result_response(self.runner.restart(&id)),
             Request::Shutdown { force } => {
@@ -496,6 +876,7 @@ impl ServerState {
             Request::ActiveCount => Response::Count(self.runner.active_count()),
             Request::ActiveCommandCount => Response::Count(self.runner.active_command_count()),
             Request::CommandCount => Response::Count(self.runner.command_count()),
+            Request::CommandStatuses => Response::CommandStatuses(self.runner.command_statuses()),
             Request::ConfiguredCommands => {
                 let ephemeral_ids = self
                     .ephemerals
@@ -569,10 +950,57 @@ impl ServerState {
                     .snapshot(&id)
                     .map(RuntimeSnapshotWire::from_runtime),
             ),
-            Request::Logs { id } => Response::Logs(self.runner.logs(&id)),
-            Request::LogUpdate { id, after } => {
-                Response::LogUpdate(self.runner.log_update(&id, after))
+            Request::Snapshots { ids } => Response::Snapshots(
+                self.runner
+                    .snapshots(&ids)
+                    .into_iter()
+                    .map(|(id, snapshot)| (id, RuntimeSnapshotWire::from_runtime(snapshot)))
+                    .collect(),
+            ),
+            Request::LogUpdate { id, after, limit } => {
+                Response::LogUpdate(self.runner.log_update_limited(&id, after, limit))
             }
+            Request::LogPage {
+                id,
+                anchor,
+                through,
+                limit,
+            } => Response::LogPage(self.runner.log_page(&id, anchor, through, limit)),
+            Request::SearchLogs {
+                id,
+                query,
+                insensitive_regex,
+                from,
+                backwards,
+                page_limit,
+            } => match self.runner.search_logs(
+                &id,
+                &query,
+                insensitive_regex,
+                from,
+                backwards,
+                page_limit,
+            ) {
+                Ok(result) => Response::LogSearch(result),
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            },
+            Request::DumpLogs {
+                id,
+                path,
+                timestamps,
+            } => match dump_logs_from_handle(
+                &RunnerHandle::Local(self.runner.clone()),
+                &id,
+                &path,
+                timestamps,
+            ) {
+                Ok(export) => Response::LogExport(export),
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            },
             Request::ClearLogs { id } => result_response(self.runner.clear_logs(&id)),
             Request::Ephemerals => match self.ephemerals.lock() {
                 Ok(ephemerals) => Response::Ephemerals(ephemerals.values().cloned().collect()),
@@ -580,6 +1008,15 @@ impl ServerState {
                     message: "Blade ephemeral state lock is poisoned".to_owned(),
                 },
             },
+            Request::ShutdownSession { force } => {
+                self.runner.shutdown(force);
+                if force {
+                    self.terminate.store(true, Ordering::Release);
+                } else {
+                    self.shutdown_when_idle.store(true, Ordering::Release);
+                }
+                Response::Ok
+            }
             Request::TerminateSession => {
                 self.runner.shutdown(true);
                 self.terminate.store(true, Ordering::Release);
@@ -587,6 +1024,29 @@ impl ServerState {
             }
         }
     }
+}
+
+fn dump_logs_from_handle(
+    runner: &RunnerHandle,
+    id: &str,
+    path: &Path,
+    timestamps: bool,
+) -> Result<LogExport> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "could not create {}; choose a new path (existing files are never overwritten)",
+                path.display()
+            )
+        })?;
+    runner.stream_logs(id, timestamps, &mut file)
 }
 
 fn result_response(result: Result<()>) -> Response {
@@ -620,18 +1080,19 @@ pub fn load_descriptor(path: &Path) -> Result<SessionDescriptor> {
         .with_context(|| format!("could not read Blade session {}", path.display()))?;
     let descriptor: SessionDescriptor = toml::from_str(&text)
         .with_context(|| format!("could not parse Blade session {}", path.display()))?;
-    if descriptor.protocol != PROTOCOL_VERSION {
+    if !protocol_is_supported(descriptor.protocol) {
         bail!(
-            "Blade session {} uses protocol {}, expected {}",
+            "Blade session {} uses protocol {}; this client supports protocols {} through {}",
             descriptor.id,
             descriptor.protocol,
+            MIN_SUPPORTED_PROTOCOL_VERSION,
             PROTOCOL_VERSION
         );
     }
     Ok(descriptor)
 }
 
-pub fn find_descriptor(query: Option<&str>) -> Result<SessionDescriptor> {
+pub fn list_descriptors() -> Result<Vec<SessionDescriptor>> {
     let runtime = runtime_directory()?;
     let mut sessions = fs::read_dir(&runtime)
         .with_context(|| format!("could not list Blade sessions in {}", runtime.display()))?
@@ -642,8 +1103,18 @@ pub fn find_descriptor(query: Option<&str>) -> Result<SessionDescriptor> {
                 .to_str()
                 .is_some_and(|name| name.ends_with(".session.toml"))
         })
-        .filter_map(|entry| load_descriptor(&entry.path()).ok())
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| toml::from_str::<SessionDescriptor>(&text).ok())
         .filter(|session| UnixStream::connect(&session.socket).is_ok())
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    Ok(sessions)
+}
+
+pub fn find_descriptor(query: Option<&str>) -> Result<SessionDescriptor> {
+    let mut sessions = list_descriptors()?
+        .into_iter()
+        .filter(|session| protocol_is_supported(session.protocol))
         .filter(|session| {
             query.is_none_or(|query| {
                 session.id == query
@@ -652,9 +1123,8 @@ pub fn find_descriptor(query: Option<&str>) -> Result<SessionDescriptor> {
             })
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     match sessions.len() {
-        0 => bail!("no matching detached Blade session was found"),
+        0 => bail!("no matching running Blade session was found"),
         1 => Ok(sessions.remove(0)),
         _ => {
             let choices = sessions
@@ -680,8 +1150,14 @@ pub fn connect_or_spawn(
     project: ProjectConfig,
     descriptor: SessionDescriptor,
 ) -> Result<(RunnerHandle, bool)> {
-    if let Ok(client) = SupervisorClient::connect(project.clone(), descriptor.clone(), None) {
-        return Ok((RunnerHandle::Remote(client), false));
+    match SupervisorClient::connect(project.clone(), descriptor.clone(), None) {
+        Ok(client) => return Ok((RunnerHandle::Remote(client), false)),
+        Err(error) if UnixStream::connect(&descriptor.socket).is_ok() => {
+            return Err(error).context(
+                "could not attach to the existing Blade supervisor; end that session with the Blade version that started it before launching this version",
+            );
+        }
+        Err(_) => {}
     }
 
     let path = descriptor_path(&descriptor.id)?;
@@ -698,7 +1174,7 @@ pub fn connect_or_spawn(
         .arg(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // SAFETY: pre_exec runs after fork in the single-threaded child and setsid
     // is async-signal-safe. A separate session prevents the supervisor from
     // receiving the TUI terminal's SIGHUP when its client detaches or crashes.
@@ -732,7 +1208,15 @@ pub fn connect_or_spawn(
                     .try_wait()
                     .context("could not inspect the Blade supervisor")?
                 {
-                    bail!("Blade supervisor exited before becoming ready ({status})");
+                    let mut stderr = String::new();
+                    if let Some(mut output) = child.stderr.take() {
+                        let _ = output.read_to_string(&mut stderr);
+                    }
+                    let stderr = stderr.trim();
+                    if stderr.is_empty() {
+                        bail!("Blade supervisor exited before becoming ready ({status})");
+                    }
+                    bail!("Blade supervisor exited before becoming ready ({status}): {stderr}");
                 }
                 thread::sleep(Duration::from_millis(25));
             }
@@ -770,9 +1254,13 @@ pub fn serve(project: ProjectConfig, descriptor: SessionDescriptor) -> Result<()
         ephemerals: Mutex::new(HashMap::new()),
         terminate: AtomicBool::new(false),
         terminate_ready: AtomicBool::new(false),
+        shutdown_when_idle: AtomicBool::new(false),
     });
     loop {
         if state.terminate_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if state.shutdown_when_idle.load(Ordering::Acquire) && state.runner.active_count() == 0 {
             return Ok(());
         }
         match listener.accept() {
@@ -884,31 +1372,44 @@ impl Drop for SessionCleanup {
 mod tests {
     use std::{
         fs,
-        sync::Mutex,
+        sync::{Mutex, atomic::Ordering},
         thread,
         time::{Duration, Instant},
     };
 
     use tempfile::tempdir;
 
-    use crate::{config::validate_file, runner::Runner};
+    use crate::{config::validate_file, log_buffer::LogPageAnchor, runner::Runner};
 
-    use super::{EphemeralState, Request, Response, RuntimeSnapshotWire, ServerState};
+    use super::{
+        EphemeralState, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ProtocolCapability,
+        Request, Response, ServerState, protocol_capabilities, protocol_is_supported,
+    };
 
     #[test]
-    fn snapshots_from_older_supervisors_without_log_metadata_remain_compatible() {
-        let snapshot: RuntimeSnapshotWire = serde_json::from_str(
-            r#"{
-                "state": "Running",
-                "pid": 42,
-                "exit_code": null,
-                "stop_level": 0,
-                "stop_remaining_millis": null
-            }"#,
-        )
-        .unwrap();
-
-        assert!(snapshot.log_metadata.is_none());
+    fn current_public_wire_format_is_protocol_one_with_explicit_capabilities() {
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert!(protocol_is_supported(1));
+        assert!(!protocol_is_supported(0));
+        assert!(!protocol_is_supported(2));
+        let capabilities = protocol_capabilities();
+        assert!(capabilities.contains(&ProtocolCapability::BatchedSnapshots));
+        assert!(capabilities.contains(&ProtocolCapability::LogPaging));
+        assert!(capabilities.contains(&ProtocolCapability::LogSearch));
+        assert!(capabilities.contains(&ProtocolCapability::CommandStatuses));
+        assert!(capabilities.contains(&ProtocolCapability::DirectSignals));
+        assert!(capabilities.contains(&ProtocolCapability::SessionShutdown));
+        assert!(matches!(
+            serde_json::from_str::<Response>(
+                r#"{"result":"pong","data":{"protocol":1}}"#
+            )
+            .unwrap(),
+            Response::Pong {
+                protocol: 1,
+                capabilities
+            } if capabilities.is_empty()
+        ));
     }
 
     #[test]
@@ -933,6 +1434,7 @@ run = "true"
             ephemerals: Mutex::new(Default::default()),
             terminate: Default::default(),
             terminate_ready: Default::default(),
+            shutdown_when_idle: Default::default(),
         };
         let mut config = project.command("base").unwrap().clone();
         config.id = "__ephemeral::1".to_owned();
@@ -971,28 +1473,80 @@ run = "true"
             Response::Snapshot(Some(snapshot)) if snapshot.state.is_active()
         ));
         assert!(matches!(
+            state.respond(Request::Snapshots {
+                ids: vec!["base".to_owned(), config.id.clone()]
+            }),
+            Response::Snapshots(snapshots)
+                if snapshots.contains_key("base") && snapshots.contains_key(&config.id)
+        ));
+        assert!(matches!(
+            state.respond(Request::CommandStatuses),
+            Response::CommandStatuses(commands)
+                if commands.iter().any(|command| command.id == "base")
+                    && commands.iter().any(|command| command.id == config.id)
+        ));
+        assert!(matches!(
             state.respond(Request::Ephemerals),
             Response::Ephemerals(commands) if commands[0].config.name == "live scratch"
         ));
         wait_until(&|| {
             matches!(
-                state.respond(Request::Logs {
-                    id: config.id.clone()
+                state.respond(Request::LogUpdate {
+                    id: config.id.clone(),
+                    after: None,
+                    limit: 256,
                 }),
-                Response::Logs(logs) if logs.iter().any(|line| line.text == "REATTACHED_LOG")
+                Response::LogUpdate(Some(update))
+                    if update.lines.iter().any(|line| line.text == "REATTACHED_LOG")
             )
         });
         assert!(matches!(
             state.respond(Request::LogUpdate {
                 id: config.id.clone(),
                 after: None,
+                limit: 256,
             }),
             Response::LogUpdate(Some(update))
                 if update.metadata.count > 0
                     && update.lines.iter().any(|line| line.text == "REATTACHED_LOG")
         ));
         assert!(matches!(
-            state.respond(Request::Stop {
+            state.respond(Request::SearchLogs {
+                id: config.id.clone(),
+                query: "reattached_log".to_owned(),
+                insensitive_regex: true,
+                from: None,
+                backwards: false,
+                page_limit: 16,
+            }),
+            Response::LogSearch(Some(result))
+                if result.page.lines.iter().any(|line| line.sequence == result.sequence)
+        ));
+        assert!(matches!(
+            state.respond(Request::LogPage {
+                id: config.id.clone(),
+                anchor: LogPageAnchor::After { sequence: None },
+                through: None,
+                limit: 1,
+            }),
+            Response::LogPage(Some(page)) if page.lines.len() == 1
+        ));
+        let dump = directory.path().join("output.log");
+        assert!(matches!(
+            state.respond(Request::DumpLogs {
+                id: config.id.clone(),
+                path: dump.clone(),
+                timestamps: false,
+            }),
+            Response::LogExport(export) if export.lines > 0 && !export.truncated
+        ));
+        assert!(
+            fs::read_to_string(&dump)
+                .unwrap()
+                .contains("REATTACHED_LOG")
+        );
+        assert!(matches!(
+            state.respond(Request::Terminate {
                 id: config.id.clone()
             }),
             Response::Ok
@@ -1005,6 +1559,17 @@ run = "true"
                 Response::Snapshot(Some(snapshot)) if !snapshot.state.is_active()
             )
         });
+        assert!(matches!(
+            state.respond(Request::ShutdownSession { force: false }),
+            Response::Ok
+        ));
+        assert!(state.shutdown_when_idle.load(Ordering::Acquire));
+        assert!(matches!(
+            state.respond(Request::Start {
+                id: config.id.clone()
+            }),
+            Response::Error { .. }
+        ));
         assert!(matches!(
             state.respond(Request::TerminateSession),
             Response::Ok

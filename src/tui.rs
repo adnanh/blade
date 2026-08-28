@@ -1,11 +1,11 @@
 use std::{
+    collections::{HashMap, HashSet},
     env,
-    fs::{self, OpenOptions},
-    io::Write,
+    io::{Write, stdout},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -14,7 +14,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -34,20 +37,30 @@ use crate::{
         ActionConfig, CommandConfig, GroupConfig, RestartAfter, action_id, set_project_theme_file,
         set_project_theme_preset, set_theme_preset, validate_file_for_combined_with_catalog,
     },
-    log_buffer::{LogKind, LogLine, LogMetadata, LogUpdate},
+    log_buffer::{LogKind, LogLine, LogMetadata, LogPageAnchor, LogUpdate},
     project_list::ProjectEntry,
     runner::{CommandState, RuntimeSnapshot},
-    supervisor::{EphemeralState, RunnerHandle},
+    supervisor::{EphemeralState, LogExport, RunnerHandle},
     theme::{PRESETS, Theme, ThemeOverrides},
 };
 
 const TICK_RATE: Duration = Duration::from_millis(75);
 const CLIPBOARD_TTL: Duration = Duration::from_secs(2 * 60);
+const LOG_PAGE_LINES: usize = 256;
+const FORM_CURSOR_MARKER: char = '\u{001f}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Commands,
     Logs,
+}
+
+#[derive(Debug, Clone)]
+struct MouseLayout {
+    commands: Rect,
+    logs: Rect,
+    command_offset: usize,
+    log_rows: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +108,14 @@ struct ThemePicker {
 struct CommandPicker {
     query: String,
     selected: usize,
+}
+
+#[derive(Default)]
+struct TreeCollapseState {
+    projects: HashSet<PathBuf>,
+    groups: HashSet<(PathBuf, String)>,
+    commands: HashSet<String>,
+    ephemeral_group: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,13 +249,20 @@ struct ManageState {
 
 #[derive(Debug, Clone, Copy)]
 struct CommandMatch {
-    item_index: usize,
+    selection: CommandSelection,
+    order: usize,
     score: i64,
 }
 
 struct ClipboardLease {
     expires_at: Instant,
     active: Arc<AtomicBool>,
+    result: Option<Arc<Mutex<Option<String>>>>,
+}
+
+struct BackgroundTask {
+    active: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +302,9 @@ struct App {
     scratchpad: Option<ScratchDialog>,
     persist_dialog: Option<PersistDialog>,
     manage: Option<ManageState>,
+    collapsed: TreeCollapseState,
     command_items: Vec<CommandSelection>,
+    runtime_snapshots: HashMap<String, RuntimeSnapshot>,
     selected_item: usize,
     focus: Focus,
     timestamps: bool,
@@ -286,8 +316,9 @@ struct App {
     wrapped_cursor_at_top: bool,
     visible_log_range: Option<(usize, usize)>,
     log_cache_name: Option<String>,
-    log_cache_state: Option<CommandState>,
     log_cache: Vec<LogLine>,
+    log_cache_metadata: Option<LogMetadata>,
+    log_cache_complete: bool,
     horizontal_scroll: u16,
     search: Option<Regex>,
     search_source: String,
@@ -299,8 +330,11 @@ struct App {
     show_help: bool,
     log_view_height: usize,
     clipboard: Option<ClipboardLease>,
+    dump_task: Option<BackgroundTask>,
     confirmation: Option<ConfirmationDialog>,
     exit_action: RunOutcome,
+    supervisor_disconnected: bool,
+    mouse_layout: Option<MouseLayout>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +349,7 @@ pub enum RunOutcome {
     Quit,
     Detached,
     Reload,
+    SessionEnded,
 }
 
 pub fn run(
@@ -328,7 +363,9 @@ pub fn run(
         StartupMode::None => {}
     }
     let mut terminal = ratatui::try_init().context("could not initialize the terminal")?;
-    let _restore = RestoreTerminal;
+    let mut restore = RestoreTerminal::new();
+    restore.enable_mouse_capture()?;
+    let _restore = restore;
     let mut app = App::new(runner.clone());
     if let Some(message) = initial_message {
         app.message = message;
@@ -348,7 +385,7 @@ pub fn select_projects(
         return Err(anyhow!("the global project list contains no projects"));
     }
     let mut terminal = ratatui::try_init().context("could not initialize the terminal")?;
-    let _restore = RestoreTerminal;
+    let _restore = RestoreTerminal::new();
     let mut selected = 0;
     let all_offset = usize::from(projects.len() > 1);
     let item_count = projects.len() + all_offset;
@@ -508,10 +545,30 @@ fn draw_project_list(
     );
 }
 
-struct RestoreTerminal;
+struct RestoreTerminal {
+    mouse_capture: bool,
+}
+
+impl RestoreTerminal {
+    fn new() -> Self {
+        Self {
+            mouse_capture: false,
+        }
+    }
+
+    fn enable_mouse_capture(&mut self) -> Result<()> {
+        crossterm::execute!(stdout(), EnableMouseCapture)
+            .context("could not enable terminal mouse capture")?;
+        self.mouse_capture = true;
+        Ok(())
+    }
+}
 
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+        }
         let _ = ratatui::try_restore();
     }
 }
@@ -519,23 +576,28 @@ impl Drop for RestoreTerminal {
 fn build_command_items(
     groups: &[GroupConfig],
     ephemeral: &[EphemeralCommand],
+    collapsed: &TreeCollapseState,
 ) -> Vec<CommandSelection> {
     let mut items = Vec::new();
     if !ephemeral.is_empty() {
         items.push(CommandSelection::EphemeralGroup);
-        for (ephemeral_index, ephemeral) in ephemeral.iter().enumerate() {
-            items.push(CommandSelection::Ephemeral(ephemeral_index));
-            items.extend(
-                ephemeral
-                    .config
-                    .actions
-                    .iter()
-                    .enumerate()
-                    .map(|(action, _)| CommandSelection::EphemeralAction {
-                        ephemeral: ephemeral_index,
-                        action,
-                    }),
-            );
+        if !collapsed.ephemeral_group {
+            for (ephemeral_index, ephemeral) in ephemeral.iter().enumerate() {
+                items.push(CommandSelection::Ephemeral(ephemeral_index));
+                if !collapsed.commands.contains(&ephemeral.config.id) {
+                    items.extend(
+                        ephemeral
+                            .config
+                            .actions
+                            .iter()
+                            .enumerate()
+                            .map(|(action, _)| CommandSelection::EphemeralAction {
+                                ephemeral: ephemeral_index,
+                                action,
+                            }),
+                    );
+                }
+            }
         }
     }
     let mut previous_project = None;
@@ -548,23 +610,34 @@ fn build_command_items(
             }
             previous_project = group.project.as_deref();
         }
+        if group.project.is_some() && collapsed.projects.contains(&group.project_file) {
+            continue;
+        }
         items.push(CommandSelection::Group(group_index));
+        if collapsed
+            .groups
+            .contains(&(group.project_file.clone(), group.name.clone()))
+        {
+            continue;
+        }
         for (command, command_config) in group.commands.iter().enumerate() {
             items.push(CommandSelection::Command {
                 group: group_index,
                 command,
             });
-            items.extend(
-                command_config
-                    .actions
-                    .iter()
-                    .enumerate()
-                    .map(|(action, _)| CommandSelection::Action {
-                        group: group_index,
-                        command,
-                        action,
-                    }),
-            );
+            if !collapsed.commands.contains(&command_config.id) {
+                items.extend(
+                    command_config
+                        .actions
+                        .iter()
+                        .enumerate()
+                        .map(|(action, _)| CommandSelection::Action {
+                            group: group_index,
+                            command,
+                            action,
+                        }),
+                );
+            }
         }
     }
     items
@@ -664,7 +737,8 @@ impl App {
                 group_names: Vec::new(),
             });
         }
-        let command_items = build_command_items(&groups, &ephemeral);
+        let collapsed = TreeCollapseState::default();
+        let command_items = build_command_items(&groups, &ephemeral, &collapsed);
         let selected_item = command_items
             .iter()
             .position(|item| matches!(item, CommandSelection::Command { .. }))
@@ -690,12 +764,14 @@ impl App {
             scratchpad: None,
             persist_dialog: None,
             manage: None,
+            collapsed,
             groups,
             project_catalog,
             ephemeral,
             next_ephemeral_id,
             runner,
             command_items,
+            runtime_snapshots: HashMap::new(),
             selected_item,
             focus: Focus::Commands,
             timestamps: true,
@@ -707,8 +783,9 @@ impl App {
             wrapped_cursor_at_top: false,
             visible_log_range: None,
             log_cache_name: None,
-            log_cache_state: None,
             log_cache: Vec::new(),
+            log_cache_metadata: None,
+            log_cache_complete: false,
             horizontal_scroll: 0,
             search: None,
             search_source: String::new(),
@@ -722,13 +799,16 @@ impl App {
             show_help: false,
             log_view_height: 1,
             clipboard: None,
+            dump_task: None,
             confirmation: None,
             exit_action: RunOutcome::Quit,
+            supervisor_disconnected: false,
+            mouse_layout: None,
         }
     }
 
     fn rebuild_command_items(&mut self, selected_id: Option<&str>) {
-        self.command_items = build_command_items(&self.groups, &self.ephemeral);
+        self.command_items = build_command_items(&self.groups, &self.ephemeral, &self.collapsed);
         if let Some(selected_id) = selected_id
             && let Some(index) = self.command_items.iter().position(|selection| {
                 command_id_for_selection(selection, &self.groups, &self.ephemeral)
@@ -743,9 +823,227 @@ impl App {
             .min(self.command_items.len().saturating_sub(1));
     }
 
+    fn rebuild_command_items_for_selection(&mut self, selection: CommandSelection) {
+        self.command_items = build_command_items(&self.groups, &self.ephemeral, &self.collapsed);
+        if let Some(index) = self
+            .command_items
+            .iter()
+            .position(|candidate| *candidate == selection)
+        {
+            self.selected_item = index;
+        } else {
+            self.selected_item = self
+                .selected_item
+                .min(self.command_items.len().saturating_sub(1));
+        }
+    }
+
+    fn reveal_selection(&mut self, selection: CommandSelection) {
+        match selection {
+            CommandSelection::EphemeralGroup => self.collapsed.ephemeral_group = false,
+            CommandSelection::Ephemeral(index) => {
+                self.collapsed.ephemeral_group = false;
+                if let Some(command) = self.ephemeral.get(index) {
+                    self.collapsed.commands.remove(&command.config.id);
+                }
+            }
+            CommandSelection::EphemeralAction { ephemeral, .. } => {
+                self.collapsed.ephemeral_group = false;
+                if let Some(command) = self.ephemeral.get(ephemeral) {
+                    self.collapsed.commands.remove(&command.config.id);
+                }
+            }
+            CommandSelection::Project { first_group } => {
+                if let Some(group) = self.groups.get(first_group) {
+                    self.collapsed.projects.remove(&group.project_file);
+                }
+            }
+            CommandSelection::Group(group) => {
+                if let Some(group) = self.groups.get(group) {
+                    self.collapsed.projects.remove(&group.project_file);
+                    self.collapsed
+                        .groups
+                        .remove(&(group.project_file.clone(), group.name.clone()));
+                }
+            }
+            CommandSelection::Command { group, command }
+            | CommandSelection::Action { group, command, .. } => {
+                if let Some(group) = self.groups.get(group) {
+                    self.collapsed.projects.remove(&group.project_file);
+                    self.collapsed
+                        .groups
+                        .remove(&(group.project_file.clone(), group.name.clone()));
+                    if let Some(command) = group.commands.get(command) {
+                        self.collapsed.commands.remove(&command.id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_selected_tree_expanded(&mut self, expanded: bool) {
+        let Some(selection) = self.command_items.get(self.selected_item).copied() else {
+            return;
+        };
+        let mut target = selection;
+        let changed = match selection {
+            CommandSelection::EphemeralGroup => {
+                let changed = self.collapsed.ephemeral_group == expanded;
+                self.collapsed.ephemeral_group = !expanded;
+                changed
+            }
+            CommandSelection::Ephemeral(index) => self
+                .ephemeral
+                .get(index)
+                .filter(|command| !command.config.actions.is_empty())
+                .is_some_and(|command| {
+                    if expanded {
+                        self.collapsed.commands.remove(&command.config.id)
+                    } else {
+                        self.collapsed.commands.insert(command.config.id.clone())
+                    }
+                }),
+            CommandSelection::EphemeralAction { ephemeral, .. } if !expanded => {
+                target = CommandSelection::Ephemeral(ephemeral);
+                self.ephemeral.get(ephemeral).is_some_and(|command| {
+                    self.collapsed.commands.insert(command.config.id.clone())
+                })
+            }
+            CommandSelection::Project { first_group } => {
+                self.groups.get(first_group).is_some_and(|group| {
+                    if expanded {
+                        self.collapsed.projects.remove(&group.project_file)
+                    } else {
+                        self.collapsed.projects.insert(group.project_file.clone())
+                    }
+                })
+            }
+            CommandSelection::Group(group) => self.groups.get(group).is_some_and(|group| {
+                let key = (group.project_file.clone(), group.name.clone());
+                if expanded {
+                    self.collapsed.groups.remove(&key)
+                } else {
+                    self.collapsed.groups.insert(key)
+                }
+            }),
+            CommandSelection::Command { group, command } => self
+                .groups
+                .get(group)
+                .and_then(|group| group.commands.get(command))
+                .filter(|command| !command.actions.is_empty())
+                .is_some_and(|command| {
+                    if expanded {
+                        self.collapsed.commands.remove(&command.id)
+                    } else {
+                        self.collapsed.commands.insert(command.id.clone())
+                    }
+                }),
+            CommandSelection::Action { group, command, .. } if !expanded => {
+                target = CommandSelection::Command { group, command };
+                self.groups
+                    .get(group)
+                    .and_then(|group| group.commands.get(command))
+                    .is_some_and(|command| self.collapsed.commands.insert(command.id.clone()))
+            }
+            CommandSelection::EphemeralAction { .. } | CommandSelection::Action { .. } => false,
+        };
+        if changed {
+            self.rebuild_command_items_for_selection(target);
+            self.reset_log_navigation();
+            self.message = if expanded {
+                "expanded selected tree node".to_owned()
+            } else {
+                "collapsed selected tree node".to_owned()
+            };
+        } else {
+            self.message = if expanded {
+                "selected tree node is already expanded or has no children".to_owned()
+            } else {
+                "selected tree node is already collapsed or has no children".to_owned()
+            };
+        }
+    }
+
+    fn collapse_all_tree_nodes(&mut self) {
+        let selection = self.command_items.get(self.selected_item).copied();
+        self.collapsed.ephemeral_group = !self.ephemeral.is_empty();
+        for group in &self.groups {
+            if group.project.is_some() {
+                self.collapsed.projects.insert(group.project_file.clone());
+            }
+            self.collapsed
+                .groups
+                .insert((group.project_file.clone(), group.name.clone()));
+            self.collapsed.commands.extend(
+                group
+                    .commands
+                    .iter()
+                    .filter(|command| !command.actions.is_empty())
+                    .map(|command| command.id.clone()),
+            );
+        }
+        self.collapsed.commands.extend(
+            self.ephemeral
+                .iter()
+                .filter(|command| !command.config.actions.is_empty())
+                .map(|command| command.config.id.clone()),
+        );
+        self.command_items = build_command_items(&self.groups, &self.ephemeral, &self.collapsed);
+        if let Some(selection) = selection {
+            let target = match selection {
+                CommandSelection::EphemeralGroup
+                | CommandSelection::Ephemeral(_)
+                | CommandSelection::EphemeralAction { .. } => CommandSelection::EphemeralGroup,
+                CommandSelection::Project { .. } => selection,
+                CommandSelection::Group(group)
+                | CommandSelection::Command { group, .. }
+                | CommandSelection::Action { group, .. } => {
+                    if let Some(config) = self.groups.get(group)
+                        && config.project.is_some()
+                    {
+                        let first_group = self
+                            .groups
+                            .iter()
+                            .position(|candidate| {
+                                candidate.project_file == config.project_file
+                                    && candidate.project == config.project
+                            })
+                            .unwrap_or(group);
+                        CommandSelection::Project { first_group }
+                    } else {
+                        CommandSelection::Group(group)
+                    }
+                }
+            };
+            if let Some(index) = self
+                .command_items
+                .iter()
+                .position(|candidate| *candidate == target)
+            {
+                self.selected_item = index;
+            }
+        }
+        self.reset_log_navigation();
+        self.message = "collapsed all tree nodes".to_owned();
+    }
+
+    fn expand_all_tree_nodes(&mut self) {
+        let selection = self.command_items.get(self.selected_item).copied();
+        self.collapsed = TreeCollapseState::default();
+        if let Some(selection) = selection {
+            self.rebuild_command_items_for_selection(selection);
+        } else {
+            self.command_items =
+                build_command_items(&self.groups, &self.ephemeral, &self.collapsed);
+        }
+        self.reset_log_navigation();
+        self.message = "expanded all tree nodes".to_owned();
+    }
+
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<RunOutcome> {
         loop {
             self.refresh_clipboard();
+            self.refresh_dump_task();
             if self.shutting_down && self.runner.active_count() == 0 {
                 return Ok(self.exit_action);
             }
@@ -756,6 +1054,9 @@ impl App {
                 return Ok(self.exit_action);
             }
             terminal.draw(|frame| self.draw(frame))?;
+            if self.supervisor_disconnected {
+                return Ok(RunOutcome::SessionEnded);
+            }
             if !event::poll(TICK_RATE)? {
                 continue;
             }
@@ -765,10 +1066,151 @@ impl App {
                         return Ok(self.exit_action);
                     }
                 }
+                Event::Mouse(mouse) => self.handle_mouse(mouse),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.mode, InputMode::Normal)
+            || self.confirmation.is_some()
+            || self.command_picker.is_some()
+            || self.theme_picker.is_some()
+            || self.scratchpad.is_some()
+            || self.manage.is_some()
+            || self.persist_dialog.is_some()
+            || self.show_help
+        {
+            return;
+        }
+        let Some(layout) = self.mouse_layout.as_ref() else {
+            return;
+        };
+        let in_commands = rect_contains(layout.commands, mouse.column, mouse.row);
+        let in_logs = rect_contains(layout.logs, mouse.column, mouse.row);
+        let command_index = content_contains(layout.commands, mouse.column, mouse.row)
+            .then(|| content_row(layout.commands, mouse.row))
+            .flatten()
+            .map(|row| layout.command_offset + row)
+            .filter(|index| *index < self.command_items.len());
+        let log_index = content_contains(layout.logs, mouse.column, mouse.row)
+            .then(|| content_row(layout.logs, mouse.row))
+            .flatten()
+            .and_then(|row| layout.log_rows.get(row))
+            .copied()
+            .flatten();
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if in_commands => {
+                self.focus = Focus::Commands;
+                if let Some(index) = command_index
+                    && self.selected_item != index
+                {
+                    self.selected_item = index;
+                    self.reset_log_navigation();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_logs => {
+                self.focus = Focus::Logs;
+                if let Some(index) = log_index {
+                    self.select_log_index(index);
+                }
+            }
+            MouseEventKind::ScrollUp if in_commands => {
+                self.focus = Focus::Commands;
+                self.select_previous_command();
+            }
+            MouseEventKind::ScrollDown if in_commands => {
+                self.focus = Focus::Commands;
+                self.select_next_command();
+            }
+            MouseEventKind::ScrollUp if in_logs => {
+                self.focus = Focus::Logs;
+                self.move_log_cursor(-3);
+            }
+            MouseEventKind::ScrollDown if in_logs => {
+                self.focus = Focus::Logs;
+                self.move_log_cursor(3);
+            }
+            MouseEventKind::ScrollLeft if in_logs && !self.wrap_logs => {
+                self.focus = Focus::Logs;
+                self.horizontal_scroll = self.horizontal_scroll.saturating_sub(4);
+            }
+            MouseEventKind::ScrollRight if in_logs && !self.wrap_logs => {
+                self.focus = Focus::Logs;
+                self.horizontal_scroll = self.horizontal_scroll.saturating_add(4);
+            }
+            _ => {}
+        }
+    }
+
+    fn select_log_index(&mut self, index: usize) {
+        let Some(line) = self.log_cache.get(index) else {
+            return;
+        };
+        self.log_cursor = index;
+        self.wrapped_cursor_at_top = false;
+        self.follow = self
+            .log_cache_metadata
+            .and_then(|metadata| metadata.last_sequence)
+            == Some(line.sequence);
+    }
+
+    fn refresh_runtime_snapshots(&mut self) {
+        let ids = self
+            .groups
+            .iter()
+            .flat_map(|group| group.commands.iter())
+            .flat_map(|command| {
+                std::iter::once(command.id.clone())
+                    .chain(command.actions.iter().map(|action| action.id.clone()))
+            })
+            .chain(self.ephemeral.iter().flat_map(|command| {
+                std::iter::once(command.config.id.clone()).chain(
+                    command
+                        .config
+                        .actions
+                        .iter()
+                        .map(|action| action.id.clone()),
+                )
+            }))
+            .collect::<Vec<_>>();
+        match self.runner.snapshots(&ids) {
+            Ok(snapshots) => self.runtime_snapshots = snapshots,
+            Err(_) => self.supervisor_disconnected = true,
+        }
+    }
+
+    fn active_runtime_count(&self) -> usize {
+        self.runtime_snapshots
+            .values()
+            .filter(|snapshot| snapshot.state.is_active())
+            .count()
+    }
+
+    fn command_runtime_counts(&self) -> (usize, usize) {
+        let configured = self
+            .groups
+            .iter()
+            .flat_map(|group| group.commands.iter())
+            .map(|command| command.id.as_str())
+            .chain(
+                self.ephemeral
+                    .iter()
+                    .map(|command| command.config.id.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let active = configured
+            .iter()
+            .filter(|id| {
+                self.runtime_snapshots
+                    .get(**id)
+                    .is_some_and(|snapshot| snapshot.state.is_active())
+            })
+            .count();
+        (active, configured.len())
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -802,6 +1244,18 @@ impl App {
             self.show_help = false;
             return Ok(false);
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('+') | KeyCode::Char('='))
+        {
+            self.expand_all_tree_nodes();
+            return Ok(false);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('-') | KeyCode::Char('_'))
+        {
+            self.collapse_all_tree_nodes();
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.open_confirmation(ConfirmationAction::Quit);
             return Ok(false);
@@ -821,6 +1275,8 @@ impl App {
             KeyCode::Char('p') => self.open_persist_dialog(),
             KeyCode::Char('M') => self.open_manage(),
             KeyCode::Char('D') => self.forget_ephemeral(),
+            KeyCode::Char('+') => self.set_selected_tree_expanded(true),
+            KeyCode::Char('-') => self.set_selected_tree_expanded(false),
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Commands => Focus::Logs,
@@ -856,9 +1312,7 @@ impl App {
             KeyCode::PageUp => self.move_log_cursor(-(self.log_view_height as isize)),
             KeyCode::PageDown => self.move_log_cursor(self.log_view_height as isize),
             KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Logs => {
-                self.follow = false;
-                self.log_cursor = 0;
-                self.wrapped_cursor_at_top = true;
+                self.load_first_selected_log_page();
             }
             KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Logs => {
                 self.follow = true;
@@ -1177,8 +1631,9 @@ impl App {
         self.wrapped_cursor_at_top = false;
         self.visible_log_range = None;
         self.log_cache_name = None;
-        self.log_cache_state = None;
         self.log_cache.clear();
+        self.log_cache_metadata = None;
+        self.log_cache_complete = false;
         self.horizontal_scroll = 0;
         if search_was_active {
             self.message = "search cleared after changing selection".to_owned();
@@ -1231,9 +1686,10 @@ impl App {
                     return;
                 };
                 let label = self
-                    .command_picker_label(hit.item_index)
+                    .command_picker_label(hit.selection)
                     .unwrap_or_else(|| "command".to_owned());
-                self.selected_item = hit.item_index;
+                self.reveal_selection(hit.selection);
+                self.rebuild_command_items_for_selection(hit.selection);
                 self.command_picker = None;
                 self.focus = Focus::Commands;
                 self.reset_log_navigation();
@@ -1287,11 +1743,12 @@ impl App {
     }
 
     fn command_matches(&self, query: &str) -> Vec<CommandMatch> {
-        let mut matches = self
-            .command_items
+        let expanded = TreeCollapseState::default();
+        let all_items = build_command_items(&self.groups, &self.ephemeral, &expanded);
+        let mut matches = all_items
             .iter()
             .enumerate()
-            .filter_map(|(item_index, selection)| {
+            .filter_map(|(order, selection)| {
                 let (command_name, qualified) = match *selection {
                     CommandSelection::Ephemeral(index) => {
                         let command = &self.ephemeral.get(index)?.config;
@@ -1349,20 +1806,24 @@ impl App {
                         .chain(fuzzy_score(&qualified, query))
                         .max()?
                 };
-                Some(CommandMatch { item_index, score })
+                Some(CommandMatch {
+                    selection: *selection,
+                    order,
+                    score,
+                })
             })
             .collect::<Vec<_>>();
         matches.sort_by(|left, right| {
             right
                 .score
                 .cmp(&left.score)
-                .then_with(|| left.item_index.cmp(&right.item_index))
+                .then_with(|| left.order.cmp(&right.order))
         });
         matches
     }
 
-    fn command_picker_label(&self, item_index: usize) -> Option<String> {
-        match *self.command_items.get(item_index)? {
+    fn command_picker_label(&self, selection: CommandSelection) -> Option<String> {
+        match selection {
             CommandSelection::Ephemeral(index) => Some(format!(
                 "Ephemeral / {}",
                 self.ephemeral.get(index)?.config.name
@@ -1499,23 +1960,150 @@ impl App {
         let Some(name) = self.selected_command_name().map(str::to_owned) else {
             return;
         };
-        let count = if self.log_cache_name.as_deref() == Some(name.as_str()) {
-            self.log_cache.len()
-        } else {
-            self.runner.logs(&name).len()
-        };
-        if count == 0 {
+        if self.log_cache_name.as_deref() != Some(name.as_str()) || self.log_cache.is_empty() {
             return;
         }
+        let metadata = self
+            .log_cache_metadata
+            .unwrap_or_else(|| log_metadata_for(&self.log_cache));
+        if metadata.count == 0 {
+            return;
+        }
+        let offset = log_cache_offset(&self.log_cache, metadata);
+        let current = offset + self.log_cursor.min(self.log_cache.len().saturating_sub(1));
+        let target = current
+            .saturating_add_signed(amount)
+            .min(metadata.count.saturating_sub(1));
+
+        if amount < 0 && target <= offset.saturating_add(self.log_view_height) && offset > 0 {
+            self.load_log_page_before(&name);
+        }
+        while target
+            < log_cache_offset(&self.log_cache, self.log_cache_metadata.unwrap_or(metadata))
+        {
+            if !self.load_log_page_before(&name) {
+                break;
+            }
+        }
+        while target
+            >= log_cache_offset(&self.log_cache, self.log_cache_metadata.unwrap_or(metadata))
+                .saturating_add(self.log_cache.len())
+        {
+            if !self.load_log_page_after(&name) {
+                break;
+            }
+        }
+
+        let metadata = self.log_cache_metadata.unwrap_or(metadata);
+        let offset = log_cache_offset(&self.log_cache, metadata);
         self.wrapped_cursor_at_top = false;
         self.follow = false;
-        self.log_cursor = self
-            .log_cursor
-            .saturating_add_signed(amount)
-            .min(count.saturating_sub(1));
-        if self.log_cursor + 1 == count {
-            self.follow = true;
+        self.log_cursor = target
+            .saturating_sub(offset)
+            .min(self.log_cache.len().saturating_sub(1));
+        self.follow = target + 1 == metadata.count
+            && self.log_cache.last().map(|line| line.sequence) == metadata.last_sequence;
+    }
+
+    fn load_first_selected_log_page(&mut self) {
+        if let Some(name) = self.selected_command_name().map(str::to_owned) {
+            match self.runner.log_page(
+                &name,
+                LogPageAnchor::After { sequence: None },
+                None,
+                LOG_PAGE_LINES,
+            ) {
+                Ok(Some(update)) => {
+                    self.replace_log_page(update, None);
+                    self.follow = false;
+                    self.log_cursor = 0;
+                    self.wrapped_log_end = 0;
+                    self.wrapped_cursor_at_top = true;
+                }
+                Ok(None) => self.message = format!("unknown command {name:?}"),
+                Err(error) => self.message = format!("could not load output: {error:#}"),
+            }
         }
+    }
+
+    fn load_log_page_before(&mut self, name: &str) -> bool {
+        let Some(before) = self.log_cache.first().map(|line| line.sequence) else {
+            return false;
+        };
+        let selected = self
+            .log_cache
+            .get(self.log_cursor)
+            .map(|line| line.sequence);
+        match self.runner.log_page(
+            name,
+            LogPageAnchor::Before { sequence: before },
+            None,
+            LOG_PAGE_LINES,
+        ) {
+            Ok(Some(update)) if !update.lines.is_empty() => self.merge_log_page(update, selected),
+            Ok(_) => false,
+            Err(error) => {
+                self.message = format!("could not load earlier output: {error:#}");
+                false
+            }
+        }
+    }
+
+    fn load_log_page_after(&mut self, name: &str) -> bool {
+        let after = self.log_cache.last().map(|line| line.sequence);
+        let selected = self
+            .log_cache
+            .get(self.log_cursor)
+            .map(|line| line.sequence);
+        match self.runner.log_page(
+            name,
+            LogPageAnchor::After { sequence: after },
+            None,
+            LOG_PAGE_LINES,
+        ) {
+            Ok(Some(update)) if !update.lines.is_empty() => self.merge_log_page(update, selected),
+            Ok(_) => false,
+            Err(error) => {
+                self.message = format!("could not load later output: {error:#}");
+                false
+            }
+        }
+    }
+
+    fn merge_log_page(&mut self, update: LogUpdate, selected: Option<u64>) -> bool {
+        let old_first = self.log_cache.first().map(|line| line.sequence);
+        let old_last = self.log_cache.last().map(|line| line.sequence);
+        let metadata = update.metadata;
+        merge_paged_logs(&mut self.log_cache, update);
+        self.log_cache_metadata = Some(metadata);
+        self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
+        if let Some(sequence) = selected {
+            self.log_cursor = self
+                .log_cache
+                .iter()
+                .position(|line| line.sequence == sequence)
+                .unwrap_or_default();
+        }
+        self.wrapped_log_end = self.log_cursor;
+        self.visible_log_range = None;
+        old_first != self.log_cache.first().map(|line| line.sequence)
+            || old_last != self.log_cache.last().map(|line| line.sequence)
+    }
+
+    fn replace_log_page(&mut self, update: LogUpdate, selected: Option<u64>) {
+        let metadata = update.metadata;
+        self.log_cache = update.lines;
+        self.log_cache_metadata = Some(metadata);
+        self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
+        self.log_cursor = selected
+            .and_then(|sequence| {
+                self.log_cache
+                    .iter()
+                    .position(|line| line.sequence == sequence)
+            })
+            .unwrap_or_default();
+        self.wrapped_log_end = self.log_cursor;
+        self.visible_log_range = None;
     }
 
     fn start_selected(&mut self) {
@@ -3462,62 +4050,54 @@ impl App {
     }
 
     fn next_search_match(&mut self, backwards: bool) {
-        let Some(regex) = &self.search else {
+        if self.search.is_none() {
             self.message = "press / for exact search or \\ for regex search".to_owned();
             return;
-        };
+        }
         let Some(name) = self.selected_command_name().map(str::to_owned) else {
             self.message = "select a command to search its output".to_owned();
             return;
         };
-        let fetched_logs;
-        let logs = if self.log_cache_name.as_deref() == Some(name.as_str()) {
-            &self.log_cache
-        } else {
-            fetched_logs = self.runner.logs(&name);
-            &fetched_logs
-        };
-        if logs.is_empty() {
-            self.message = "no output to search".to_owned();
-            return;
+        let from = self
+            .log_cache
+            .get(self.log_cursor)
+            .map(|line| line.sequence);
+        match self.runner.search_logs(
+            &name,
+            &self.search_source,
+            self.search_kind == SearchKind::InsensitiveRegex,
+            from,
+            backwards,
+            LOG_PAGE_LINES,
+        ) {
+            Ok(Some(result)) => {
+                self.replace_log_page(result.page, Some(result.sequence));
+                self.follow = false;
+                self.position_search_result();
+                self.message = format!(
+                    "match for {}",
+                    search_expression(&self.search_source, self.search_kind)
+                );
+            }
+            Ok(None) => {
+                self.message = format!(
+                    "no matches for {}",
+                    search_expression(&self.search_source, self.search_kind)
+                );
+            }
+            Err(error) => self.message = format!("could not search output: {error:#}"),
         }
-        let mut indices: Vec<_> = logs
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| regex.is_match(&line.text))
-            .map(|(index, _)| index)
-            .collect();
-        if backwards {
-            indices.reverse();
-        }
-        let found = if backwards {
-            indices
-                .iter()
-                .copied()
-                .find(|index| *index < self.log_cursor)
-                .or_else(|| indices.first().copied())
-        } else {
-            indices
-                .iter()
-                .copied()
-                .find(|index| *index > self.log_cursor)
-                .or_else(|| indices.first().copied())
-        };
-        if let Some(index) = found {
-            self.follow = false;
-            self.log_cursor = index;
-            self.wrapped_cursor_at_top =
-                search_needs_top_alignment(self.wrap_logs, self.visible_log_range, index);
-            self.message = format!(
-                "match for {}",
-                search_expression(&self.search_source, self.search_kind)
-            );
-        } else {
-            self.message = format!(
-                "no matches for {}",
-                search_expression(&self.search_source, self.search_kind)
-            );
-        }
+    }
+
+    fn position_search_result(&mut self) {
+        let context = self.log_view_height / 2;
+        let last = self.log_cache.len().saturating_sub(1);
+        self.wrapped_log_end = self.log_cursor.saturating_add(context).min(last);
+        self.wrapped_cursor_at_top = false;
+        self.log_scroll = self
+            .log_cursor
+            .saturating_sub(context)
+            .min(self.log_cache.len().saturating_sub(self.log_view_height));
     }
 
     fn copy_current_line(&mut self) {
@@ -3525,14 +4105,16 @@ impl App {
             self.message = "select a command to copy its output".to_owned();
             return;
         };
-        let fetched_logs;
-        let logs = if self.log_cache_name.as_deref() == Some(name.as_str()) {
-            &self.log_cache
+        let line = if self.log_cache_name.as_deref() == Some(name.as_str()) {
+            self.log_cache
+                .get(self.log_cursor.min(self.log_cache.len().saturating_sub(1)))
+                .cloned()
         } else {
-            fetched_logs = self.runner.logs(&name);
-            &fetched_logs
+            self.runner
+                .log_tail(&name, 1)
+                .and_then(|update| update.lines.last().cloned())
         };
-        let Some(line) = logs.get(self.log_cursor.min(logs.len().saturating_sub(1))) else {
+        let Some(line) = line else {
             self.message = "no line to copy".to_owned();
             return;
         };
@@ -3546,15 +4128,14 @@ impl App {
     }
 
     fn copy_all_logs(&mut self) {
-        let Some(name) = self.selected_command_name() else {
+        let Some(name) = self.selected_command_name().map(str::to_owned) else {
             self.message = "select a command to copy its output".to_owned();
             return;
         };
-        let text = logs_as_text(&self.runner.logs(name), self.timestamps);
-        match copy_to_clipboard(text) {
+        match copy_logs_to_clipboard(&self.runner, name, self.timestamps) {
             Ok(lease) => {
                 self.clipboard = Some(lease);
-                self.message = "copied all output".to_owned();
+                self.message = "copying all output…".to_owned();
             }
             Err(error) => self.message = error.to_string(),
         }
@@ -3593,12 +4174,36 @@ impl App {
     }
 
     fn refresh_clipboard(&mut self) {
+        let result = self
+            .clipboard
+            .as_ref()
+            .and_then(|lease| lease.result.as_ref())
+            .and_then(|result| result.lock().ok().and_then(|mut result| result.take()));
+        if let Some(result) = result.as_ref() {
+            self.message = result.clone();
+        }
         let expired = self.clipboard.as_ref().is_some_and(|lease| {
             !lease.active.load(Ordering::Relaxed) || Instant::now() >= lease.expires_at
         });
         if expired {
             self.clipboard = None;
-            self.message = "clipboard lease ended".to_owned();
+            if result.is_none() {
+                self.message = "clipboard lease ended".to_owned();
+            }
+        }
+    }
+
+    fn refresh_dump_task(&mut self) {
+        let completed = self
+            .dump_task
+            .as_ref()
+            .is_some_and(|task| !task.active.load(Ordering::Relaxed));
+        if completed
+            && let Some(task) = self.dump_task.take()
+            && let Ok(mut result) = task.result.lock()
+            && let Some(result) = result.take()
+        {
+            self.message = result;
         }
     }
 
@@ -3625,20 +4230,50 @@ impl App {
                 .unwrap_or(&self.runner.project().root);
             path = root.join(path);
         }
-        let Some(name) = self.selected_command_name() else {
+        let Some(name) = self.selected_command_name().map(str::to_owned) else {
             self.message = "select a command to dump its output".to_owned();
             return;
         };
-        self.message = match write_dump(
-            &path,
-            &logs_as_text(&self.runner.logs(name), self.timestamps),
-        ) {
-            Ok(()) => format!("dumped output to {}", path.display()),
-            Err(error) => error.to_string(),
+        if self.dump_task.is_some() {
+            self.message = "a log dump is already in progress".to_owned();
+            return;
+        }
+        let runner = match self.runner.background_handle() {
+            Ok(runner) => runner,
+            Err(error) => {
+                self.message = format!("could not start log dump: {error:#}");
+                return;
+            }
         };
+        let active = Arc::new(AtomicBool::new(true));
+        let result = Arc::new(Mutex::new(None));
+        let task_active = Arc::clone(&active);
+        let task_result = Arc::clone(&result);
+        let dump_path = path.clone();
+        let timestamps = self.timestamps;
+        match thread::Builder::new()
+            .name("blade-log-dump".to_owned())
+            .spawn(move || {
+                let message = match runner.dump_logs(&name, &dump_path, timestamps) {
+                    Ok(export) => export_message("dumped", export, Some(&dump_path)),
+                    Err(error) => format!("could not dump output: {error:#}"),
+                };
+                if let Ok(mut result) = task_result.lock() {
+                    *result = Some(message);
+                }
+                task_active.store(false, Ordering::Relaxed);
+            }) {
+            Ok(_) => {
+                self.dump_task = Some(BackgroundTask { active, result });
+                self.message = format!("dumping output to {}…", path.display());
+            }
+            Err(error) => self.message = format!("could not start log dump: {error}"),
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.refresh_runtime_snapshots();
+        self.mouse_layout = None;
         let area = frame.area();
         let footer_height = if area.width >= 120 { 3 } else { 4 };
         let minimum_height = 5 + footer_height;
@@ -3676,8 +4311,14 @@ impl App {
                 .split(vertical[1]);
             (rows[0], rows[1])
         };
-        self.draw_commands(frame, commands_area);
-        self.draw_logs(frame, logs_area);
+        let command_offset = self.draw_commands(frame, commands_area);
+        let log_rows = self.draw_logs(frame, logs_area);
+        self.mouse_layout = Some(MouseLayout {
+            commands: commands_area,
+            logs: logs_area,
+            command_offset,
+            log_rows,
+        });
         self.draw_footer(frame, vertical[2]);
         if self.show_help {
             self.draw_help(frame, area);
@@ -3711,11 +4352,11 @@ impl App {
                 " Force quit Blade? ",
                 format!(
                     "Kill all {} remaining command process group(s) and quit?",
-                    self.runner.active_count()
+                    self.active_runtime_count()
                 ),
             ),
             ConfirmationAction::Quit => {
-                let active = self.runner.active_count();
+                let active = self.active_runtime_count();
                 if active == 0 {
                     (" Quit Blade? ", "Quit Blade?".to_owned())
                 } else {
@@ -3773,8 +4414,7 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let active = self.runner.active_command_count();
-        let total = self.runner.command_count();
+        let (active, total) = self.command_runtime_counts();
         let title = Line::from(vec![
             Span::styled(
                 " BLADE ",
@@ -3798,7 +4438,7 @@ impl App {
         );
     }
 
-    fn draw_commands(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_commands(&self, frame: &mut Frame<'_>, area: Rect) -> usize {
         let mut items = Vec::new();
         let mut previous_project = None;
         let row_width = area.width.saturating_sub(2) as usize;
@@ -3815,36 +4455,25 @@ impl App {
                     .add_modifier(Modifier::BOLD)
             };
             items.push(ListItem::new(Line::from(Span::styled(
-                pad_row(" ▾ Ephemeral".to_owned(), row_width),
+                pad_row(
+                    format!(
+                        " {} Ephemeral",
+                        if self.collapsed.ephemeral_group {
+                            "▸"
+                        } else {
+                            "▾"
+                        }
+                    ),
+                    row_width,
+                ),
                 style,
             ))));
-            for ephemeral in &self.ephemeral {
-                let command = &ephemeral.config;
-                let snapshot = self.runner.snapshot(&command.id);
-                let state = snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.state)
-                    .unwrap_or(CommandState::Stopped);
-                let color = state_color(state, &self.theme);
-                let style = if items.len() == self.selected_item {
-                    Style::default()
-                        .fg(contrasting_text_color(color))
-                        .bg(color)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(color)
-                };
-                items.push(ListItem::new(Line::from(Span::styled(
-                    pad_row(
-                        format!("  {} {}", state_marker(state), command.name),
-                        row_width,
-                    ),
-                    style,
-                ))));
-                for action in &command.actions {
+            if !self.collapsed.ephemeral_group {
+                for ephemeral in &self.ephemeral {
+                    let command = &ephemeral.config;
                     let state = self
-                        .runner
-                        .snapshot(&action.id)
+                        .runtime_snapshots
+                        .get(&command.id)
                         .map(|snapshot| snapshot.state)
                         .unwrap_or(CommandState::Stopped);
                     let color = state_color(state, &self.theme);
@@ -3858,11 +4487,48 @@ impl App {
                     };
                     items.push(ListItem::new(Line::from(Span::styled(
                         pad_row(
-                            format!("    ↳ {} {}", state_marker(state), action.name),
+                            format!(
+                                "  {}{} {}",
+                                if command.actions.is_empty() {
+                                    "  "
+                                } else if self.collapsed.commands.contains(&command.id) {
+                                    "▸ "
+                                } else {
+                                    "▾ "
+                                },
+                                state_marker(state),
+                                command.name
+                            ),
                             row_width,
                         ),
                         style,
                     ))));
+
+                    if !self.collapsed.commands.contains(&command.id) {
+                        for action in &command.actions {
+                            let state = self
+                                .runtime_snapshots
+                                .get(&action.id)
+                                .map(|snapshot| snapshot.state)
+                                .unwrap_or(CommandState::Stopped);
+                            let color = state_color(state, &self.theme);
+                            let style = if items.len() == self.selected_item {
+                                Style::default()
+                                    .fg(contrasting_text_color(color))
+                                    .bg(color)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(color)
+                            };
+                            items.push(ListItem::new(Line::from(Span::styled(
+                                pad_row(
+                                    format!("    ↳ {} {}", state_marker(state), action.name),
+                                    row_width,
+                                ),
+                                style,
+                            ))));
+                        }
+                    }
                 }
             }
         }
@@ -3877,12 +4543,29 @@ impl App {
                             .add_modifier(Modifier::BOLD)
                     };
                     items.push(ListItem::new(Line::from(Span::styled(
-                        pad_row(format!(" ◆ {project}"), row_width),
+                        pad_row(
+                            format!(
+                                " {} ◆ {project}",
+                                if self.collapsed.projects.contains(&group.project_file) {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                }
+                            ),
+                            row_width,
+                        ),
                         project_style,
                     ))));
                 }
                 previous_project = group.project.as_deref();
             }
+            if group.project.is_some() && self.collapsed.projects.contains(&group.project_file) {
+                continue;
+            }
+            let group_collapsed = self
+                .collapsed
+                .groups
+                .contains(&(group.project_file.clone(), group.name.clone()));
             let group_style = if items.len() == self.selected_item {
                 group_highlight_style
             } else {
@@ -3893,16 +4576,20 @@ impl App {
             items.push(ListItem::new(Line::from(Span::styled(
                 pad_row(
                     format!(
-                        "{}▾ {}",
+                        "{}{} {}",
                         if group.project.is_some() { "   " } else { " " },
+                        if group_collapsed { "▸" } else { "▾" },
                         group.name
                     ),
                     row_width,
                 ),
                 group_style,
             ))));
+            if group_collapsed {
+                continue;
+            }
             for command in &group.commands {
-                let snapshot = self.runner.snapshot(&command.id);
+                let snapshot = self.runtime_snapshots.get(&command.id);
                 let state = snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.state)
@@ -3920,11 +4607,18 @@ impl App {
                 items.push(ListItem::new(Line::from(Span::styled(
                     pad_row(
                         format!(
-                            "{}{marker} {}",
+                            "{}{}{marker} {}",
                             if group.project.is_some() {
                                 "    "
                             } else {
                                 "  "
+                            },
+                            if command.actions.is_empty() {
+                                "  "
+                            } else if self.collapsed.commands.contains(&command.id) {
+                                "▸ "
+                            } else {
+                                "▾ "
                             },
                             command.name
                         ),
@@ -3932,37 +4626,39 @@ impl App {
                     ),
                     style,
                 ))));
-                for action in &command.actions {
-                    let state = self
-                        .runner
-                        .snapshot(&action.id)
-                        .map(|snapshot| snapshot.state)
-                        .unwrap_or(CommandState::Stopped);
-                    let color = state_color(state, &self.theme);
-                    let style = if items.len() == self.selected_item {
-                        Style::default()
-                            .fg(contrasting_text_color(color))
-                            .bg(color)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(color)
-                    };
-                    items.push(ListItem::new(Line::from(Span::styled(
-                        pad_row(
-                            format!(
-                                "{}↳ {} {}",
-                                if group.project.is_some() {
-                                    "      "
-                                } else {
-                                    "    "
-                                },
-                                state_marker(state),
-                                action.name
+                if !self.collapsed.commands.contains(&command.id) {
+                    for action in &command.actions {
+                        let state = self
+                            .runtime_snapshots
+                            .get(&action.id)
+                            .map(|snapshot| snapshot.state)
+                            .unwrap_or(CommandState::Stopped);
+                        let color = state_color(state, &self.theme);
+                        let style = if items.len() == self.selected_item {
+                            Style::default()
+                                .fg(contrasting_text_color(color))
+                                .bg(color)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(color)
+                        };
+                        items.push(ListItem::new(Line::from(Span::styled(
+                            pad_row(
+                                format!(
+                                    "{}↳ {} {}",
+                                    if group.project.is_some() {
+                                        "      "
+                                    } else {
+                                        "    "
+                                    },
+                                    state_marker(state),
+                                    action.name
+                                ),
+                                row_width,
                             ),
-                            row_width,
-                        ),
-                        style,
-                    ))));
+                            style,
+                        ))));
+                    }
                 }
             }
         }
@@ -3988,57 +4684,84 @@ impl App {
             area.height.saturating_sub(2) as usize,
             &self.theme,
         );
+        state.offset()
     }
 
     fn refresh_log_cache(&mut self, name: Option<&str>, snapshot: Option<&RuntimeSnapshot>) {
         let selection_changed = self.log_cache_name.as_deref() != name;
         if selection_changed {
             self.log_cache_name = name.map(str::to_owned);
-            self.log_cache_state = None;
             self.log_cache.clear();
+            self.log_cache_metadata = None;
+            self.log_cache_complete = false;
         }
         let Some(name) = name else {
             return;
         };
-        let state = snapshot.map(|snapshot| snapshot.state);
         let metadata = snapshot.and_then(|snapshot| snapshot.log_metadata);
 
         if let Some(metadata) = metadata {
-            if !log_cache_matches(&self.log_cache, metadata) {
-                let after = self.log_cache.last().map(|line| line.sequence);
-                let updated = self.runner.log_update(name, after).is_some_and(|update| {
+            self.log_cache_metadata = Some(metadata);
+            if selection_changed {
+                if let Some(update) = self.runner.log_tail(name, LOG_PAGE_LINES) {
                     let metadata = update.metadata;
                     merge_log_update(&mut self.log_cache, update);
-                    log_cache_matches(&self.log_cache, metadata)
-                });
-                if !updated {
-                    self.log_cache = self.runner.logs(name);
+                    trim_log_cache_to_tail(&mut self.log_cache, LOG_PAGE_LINES);
+                    self.log_cache_metadata = Some(metadata);
+                    self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
                 }
-            }
-        } else {
-            // Supervisors started by older compatible binaries do not report log
-            // metadata. Keep their snapshot fixed while the user is browsing, and
-            // refresh once more when the process changes state to capture its tail.
-            let state_changed = self.log_cache_state != state;
-            let interaction_open = !matches!(self.mode, InputMode::Normal)
-                || self.command_picker.is_some()
-                || self.theme_picker.is_some()
-                || self.scratchpad.is_some()
-                || self.persist_dialog.is_some()
-                || self.manage.is_some()
-                || self.confirmation.is_some()
-                || self.show_help;
-            if selection_changed
-                || state_changed
-                || (self.follow && !interaction_open && state.is_some_and(CommandState::is_active))
-            {
-                self.log_cache = self.runner.logs(name);
+            } else if self.follow && !log_cache_is_current(&self.log_cache, metadata) {
+                let after = self.log_cache.last().map(|line| line.sequence);
+                let update = self.runner.log_update_limited(name, after, LOG_PAGE_LINES);
+                let updated = update.is_some_and(|update| {
+                    let metadata = update.metadata;
+                    let has_gap =
+                        after
+                            .zip(update.lines.first())
+                            .is_some_and(|(previous, first)| {
+                                first.sequence != previous.wrapping_add(1)
+                            });
+                    if has_gap {
+                        self.log_cache.clear();
+                    }
+                    merge_log_update(&mut self.log_cache, update);
+                    trim_log_cache_to_tail(&mut self.log_cache, LOG_PAGE_LINES);
+                    self.log_cache_metadata = Some(metadata);
+                    self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
+                    log_cache_is_current(&self.log_cache, metadata)
+                });
+                if !updated && let Some(update) = self.runner.log_tail(name, LOG_PAGE_LINES) {
+                    let metadata = update.metadata;
+                    self.log_cache.clear();
+                    merge_log_update(&mut self.log_cache, update);
+                    trim_log_cache_to_tail(&mut self.log_cache, LOG_PAGE_LINES);
+                    self.log_cache_metadata = Some(metadata);
+                    self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
+                }
+            } else if !self.follow {
+                let selected = self
+                    .log_cache
+                    .get(self.log_cursor)
+                    .map(|line| line.sequence);
+                if let Some(first_sequence) = metadata.first_sequence {
+                    self.log_cache
+                        .retain(|line| line.sequence >= first_sequence);
+                } else {
+                    self.log_cache.clear();
+                }
+                self.log_cursor = selected
+                    .and_then(|sequence| {
+                        self.log_cache
+                            .iter()
+                            .position(|line| line.sequence == sequence)
+                    })
+                    .unwrap_or_default();
+                self.log_cache_complete = log_cache_matches(&self.log_cache, metadata);
             }
         }
-        self.log_cache_state = state;
     }
 
-    fn draw_logs(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_logs(&mut self, frame: &mut Frame<'_>, area: Rect) -> Vec<Option<usize>> {
         let selected_project = self.selected_project().map(str::to_owned);
         let selected_group = if matches!(
             self.command_items.get(self.selected_item),
@@ -4052,9 +4775,15 @@ impl App {
         let name = self.selected_command_name().map(str::to_owned);
         let snapshot = name
             .as_deref()
-            .and_then(|command_name| self.runner.snapshot(command_name));
+            .and_then(|command_name| self.runtime_snapshots.get(command_name).cloned());
         self.refresh_log_cache(name.as_deref(), snapshot.as_ref());
         let logs = &self.log_cache;
+        let log_metadata = self.log_cache_metadata.unwrap_or(LogMetadata {
+            count: logs.len(),
+            first_sequence: logs.first().map(|line| line.sequence),
+            last_sequence: logs.last().map(|line| line.sequence),
+        });
+        let log_offset = log_cache_offset(logs, log_metadata);
         self.log_view_height = area.height.saturating_sub(2).max(1) as usize;
         if logs.is_empty() {
             self.log_cursor = 0;
@@ -4117,6 +4846,10 @@ impl App {
             .first()
             .zip(visible_rows.last())
             .map(|((first, _), (last, _))| (*first, *last));
+        let mut mouse_rows = visible_rows
+            .iter()
+            .map(|(index, _)| Some(*index))
+            .collect::<Vec<_>>();
         let mut visible = visible_rows
             .into_iter()
             .map(|(index, text)| {
@@ -4148,6 +4881,7 @@ impl App {
                 },
                 Style::default().fg(self.theme.muted),
             )));
+            mouse_rows.push(None);
         }
         let state = snapshot
             .as_ref()
@@ -4181,9 +4915,9 @@ impl App {
                 if logs.is_empty() {
                     0
                 } else {
-                    self.log_cursor + 1
+                    log_offset + self.log_cursor + 1
                 },
-                logs.len(),
+                log_metadata.count,
                 if self.follow { " • following" } else { "" },
                 if self.wrap_logs { "on" } else { "off" }
             )
@@ -4225,9 +4959,22 @@ impl App {
         );
         let (position, viewport) = self
             .visible_log_range
-            .map(|(first, last)| (first, last.saturating_sub(first).saturating_add(1)))
+            .map(|(first, last)| {
+                (
+                    log_offset + first,
+                    last.saturating_sub(first).saturating_add(1),
+                )
+            })
             .unwrap_or_default();
-        render_vertical_scrollbar(frame, area, logs.len(), position, viewport, &self.theme);
+        render_vertical_scrollbar(
+            frame,
+            area,
+            log_metadata.count,
+            position,
+            viewport,
+            &self.theme,
+        );
+        mouse_rows
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -4268,12 +5015,12 @@ impl App {
                 );
             }
             InputMode::Ephemeral(buffer) => {
+                let input_style = Style::default().fg(self.theme.search);
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            format!("Run ephemeral: {buffer}█  "),
-                            Style::default().fg(self.theme.search),
-                        ),
+                        Span::styled(format!("Run ephemeral: {buffer}"), input_style),
+                        Span::styled(" ", input_style.add_modifier(Modifier::REVERSED)),
+                        Span::styled("  ", input_style),
                         Span::styled("Enter", key_style),
                         Span::styled(" run  ", text_style),
                         Span::styled("Esc", key_style),
@@ -4283,18 +5030,21 @@ impl App {
                 );
             }
             InputMode::Search { buffer, kind } => {
+                let input_style = Style::default().fg(self.theme.search);
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::styled(
                             format!(
-                                "{}: {buffer}█  ",
+                                "{}: {buffer}",
                                 match kind {
                                     SearchKind::Exact => "Exact substring",
                                     SearchKind::InsensitiveRegex => "Case-insensitive regex",
                                 }
                             ),
-                            Style::default().fg(self.theme.search),
+                            input_style,
                         ),
+                        Span::styled(" ", input_style.add_modifier(Modifier::REVERSED)),
+                        Span::styled("  ", input_style),
                         Span::styled("Enter", key_style),
                         Span::styled(" apply  ", text_style),
                         Span::styled("Esc", key_style),
@@ -4304,12 +5054,12 @@ impl App {
                 );
             }
             InputMode::Dump(buffer) => {
+                let input_style = Style::default().fg(self.theme.search);
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            format!("Dump path: {buffer}█  "),
-                            Style::default().fg(self.theme.search),
-                        ),
+                        Span::styled(format!("Dump path: {buffer}"), input_style),
+                        Span::styled(" ", input_style.add_modifier(Modifier::REVERSED)),
+                        Span::styled("  ", input_style),
                         Span::styled("Enter", key_style),
                         Span::styled(" write  ", text_style),
                         Span::styled("Esc", key_style),
@@ -4324,12 +5074,15 @@ impl App {
     fn draw_help(&self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered_rect(
             72.min(area.width.saturating_sub(2)),
-            27.min(area.height.saturating_sub(2)),
+            29.min(area.height.saturating_sub(1)),
             area,
         );
         frame.render_widget(Clear, popup);
         let help = vec![
-            help_line("Tab", "switch command/output focus"),
+            help_line(
+                "Tab / mouse / touch",
+                "switch focus; click selects, wheel scrolls",
+            ),
             help_line("↑/↓ or j/k", "select group, command, or output line"),
             help_line("PgUp/PgDn, g/G", "page; first/end (end resumes follow)"),
             help_line("→ / ←", "focus panes; scroll when wrapping is off"),
@@ -4354,6 +5107,7 @@ impl App {
             help_line("p / D", "persist / remove selected ephemeral command"),
             help_line("M", "manage commands and nested actions"),
             help_line("Ctrl-P", "quick jump to a command"),
+            help_line("+/-; Ctrl++/Ctrl+-", "expand/collapse selected; all"),
             help_line("Q", "confirm detach while commands keep running"),
             help_line("R", "confirm restart and reattach"),
             help_line("q or Ctrl-C", "confirm quit; repeat and confirm to force"),
@@ -4371,7 +5125,7 @@ impl App {
         frame.render_widget(block, popup);
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -4380,8 +5134,32 @@ impl App {
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
-            .split(rows[1]);
+            .split(rows[0]);
         frame.render_widget(Paragraph::new(help), columns[1]);
+        let copyright = "(c) Adnan Hajdarevic <adnanh@gmail.com>";
+        let divider_width = rows[1]
+            .width
+            .saturating_sub(UnicodeWidthStr::width(copyright) as u16 + 2)
+            as usize;
+        let left_width = divider_width / 2;
+        let copyright_line = Line::from(vec![
+            Span::styled(
+                "─".repeat(left_width),
+                Style::default().fg(self.theme.muted),
+            ),
+            Span::styled(
+                format!(" {copyright} "),
+                Style::default().fg(self.theme.muted),
+            ),
+            Span::styled(
+                "─".repeat(divider_width.saturating_sub(left_width)),
+                Style::default().fg(self.theme.muted),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(copyright_line).alignment(Alignment::Center),
+            rows[1],
+        );
     }
 
     fn draw_scratchpad(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -5252,7 +6030,12 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled(" › ", Style::default().fg(self.theme.accent)),
                 Span::styled(picker.query.clone(), Style::default().fg(self.theme.search)),
-                Span::styled("█", Style::default().fg(self.theme.search)),
+                Span::styled(
+                    " ",
+                    Style::default()
+                        .fg(self.theme.search)
+                        .add_modifier(Modifier::REVERSED),
+                ),
             ]))
             .block(
                 Block::default()
@@ -5283,20 +6066,17 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, hit)| {
-                let command_id = command_id_for_selection(
-                    &self.command_items[hit.item_index],
-                    &self.groups,
-                    &self.ephemeral,
-                )
-                .unwrap_or_default();
+                let command_id =
+                    command_id_for_selection(&hit.selection, &self.groups, &self.ephemeral)
+                        .unwrap_or_default();
                 let state = self
-                    .runner
-                    .snapshot(command_id)
+                    .runtime_snapshots
+                    .get(command_id)
                     .map(|snapshot| snapshot.state)
                     .unwrap_or(CommandState::Stopped);
                 let color = state_color(state, &self.theme);
                 let label = self
-                    .command_picker_label(hit.item_index)
+                    .command_picker_label(hit.selection)
                     .unwrap_or_else(|| "command".to_owned());
                 let text = pad_row(format!(" {} {label}", state_marker(state)), row_width);
                 let style = if index == picker.selected {
@@ -5574,7 +6354,7 @@ fn form_text_value(value: &str, active: bool, cursor: usize, placeholder: &str) 
     if value.is_empty() {
         let placeholder = format!("<{placeholder}>");
         return if active {
-            format!("{placeholder}█")
+            format!("{placeholder}{FORM_CURSOR_MARKER} ")
         } else {
             placeholder
         };
@@ -5583,7 +6363,11 @@ fn form_text_value(value: &str, active: bool, cursor: usize, placeholder: &str) 
         return value.to_owned();
     }
     let byte = char_cursor_byte(value, cursor);
-    format!("{}█{}", &value[..byte], &value[byte..])
+    if byte == value.len() {
+        format!("{value}{FORM_CURSOR_MARKER} ")
+    } else {
+        format!("{}{FORM_CURSOR_MARKER}{}", &value[..byte], &value[byte..])
+    }
 }
 
 fn form_choice_value(value: &str, active: bool) -> String {
@@ -5598,18 +6382,52 @@ fn push_form_field(lines: &mut Vec<Line<'static>>, text: String, style: Style, w
     lines.extend(
         wrap_log_text(&text, width)
             .into_iter()
-            .map(|row| Line::from(Span::styled(pad_row(row, width), style))),
+            .map(|row| styled_form_row(row, style, width)),
     );
     lines.push(Line::from(""));
+}
+
+fn styled_form_row(row: String, style: Style, width: usize) -> Line<'static> {
+    let Some(marker) = row.find(FORM_CURSOR_MARKER) else {
+        return Line::from(Span::styled(pad_row(row, width), style));
+    };
+    let marker_end = marker + FORM_CURSOR_MARKER.len_utf8();
+    let before = &row[..marker];
+    let after = &row[marker_end..];
+    let cursor_end = after
+        .char_indices()
+        .nth(1)
+        .map(|(byte, _)| byte)
+        .unwrap_or(after.len());
+    let cursor_character = &after[..cursor_end];
+    let remainder = &after[cursor_end..];
+    let visible_width = UnicodeWidthStr::width(before)
+        + UnicodeWidthStr::width(cursor_character)
+        + UnicodeWidthStr::width(remainder);
+
+    Line::from(vec![
+        Span::styled(before.to_owned(), style),
+        Span::styled(
+            cursor_character.to_owned(),
+            style.add_modifier(Modifier::REVERSED),
+        ),
+        Span::styled(
+            format!(
+                "{remainder}{}",
+                " ".repeat(width.saturating_sub(visible_width))
+            ),
+            style,
+        ),
+    ])
 }
 
 fn form_scroll(lines: &[Line<'_>], height: usize) -> u16 {
     let focus = lines
         .iter()
         .position(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains('█') || span.content.contains('‹'))
+            line.spans.iter().any(|span| {
+                span.content.contains('‹') || span.style.add_modifier.contains(Modifier::REVERSED)
+            })
         })
         .unwrap_or_default();
     focus
@@ -5737,7 +6555,7 @@ fn footer_shortcuts(width: u16, rows: u16) -> Vec<(&'static str, &'static str)> 
         ("d", " dump  "),
         ("q", " quit  "),
     ];
-    const SECONDARY: [(&str, &str); 14] = [
+    const SECONDARY: [(&str, &str); 15] = [
         ("c", " clear  "),
         (":", " ephemeral  "),
         (";", " scratch  "),
@@ -5745,6 +6563,7 @@ fn footer_shortcuts(width: u16, rows: u16) -> Vec<(&'static str, &'static str)> 
         ("R", " reload  "),
         ("p/D", " save/remove  "),
         ("M", " manage  "),
+        ("+/-", " tree  "),
         ("Tab", " focus  "),
         ("w", " wrap  "),
         ("PgUp/PgDn", " page  "),
@@ -5815,18 +6634,6 @@ fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
     Some(score - candidate_chars.len() as i64)
 }
 
-fn logs_as_text(logs: &[LogLine], timestamps: bool) -> String {
-    let mut text = logs
-        .iter()
-        .map(|line| line.display(timestamps))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text
-}
-
 fn styled_log_line(
     line: &LogLine,
     text: String,
@@ -5848,14 +6655,6 @@ fn styled_log_line(
     Line::from(Span::styled(text, style))
 }
 
-fn search_needs_top_alignment(
-    wrap_logs: bool,
-    visible_range: Option<(usize, usize)>,
-    index: usize,
-) -> bool {
-    wrap_logs && visible_range.is_some_and(|(first, _)| index < first)
-}
-
 fn build_search_regex(query: &str, kind: SearchKind) -> Result<Regex, regex::Error> {
     match kind {
         SearchKind::Exact => RegexBuilder::new(&regex::escape(query)).build(),
@@ -5870,10 +6669,47 @@ fn search_expression(query: &str, kind: SearchKind) -> String {
     }
 }
 
+fn log_metadata_for(logs: &[LogLine]) -> LogMetadata {
+    LogMetadata {
+        count: logs.len(),
+        first_sequence: logs.first().map(|line| line.sequence),
+        last_sequence: logs.last().map(|line| line.sequence),
+    }
+}
+
 fn log_cache_matches(logs: &[LogLine], metadata: LogMetadata) -> bool {
     logs.len() == metadata.count
         && logs.first().map(|line| line.sequence) == metadata.first_sequence
         && logs.last().map(|line| line.sequence) == metadata.last_sequence
+}
+
+fn log_cache_is_current(logs: &[LogLine], metadata: LogMetadata) -> bool {
+    if metadata.count == 0 {
+        return logs.is_empty();
+    }
+    let Some(first) = logs.first().map(|line| line.sequence) else {
+        return false;
+    };
+    logs.len() <= metadata.count
+        && metadata
+            .first_sequence
+            .is_some_and(|first_sequence| first >= first_sequence)
+        && logs.last().map(|line| line.sequence) == metadata.last_sequence
+}
+
+fn log_cache_offset(logs: &[LogLine], metadata: LogMetadata) -> usize {
+    logs.first()
+        .map(|line| line.sequence)
+        .zip(metadata.first_sequence)
+        .and_then(|(loaded, first)| usize::try_from(loaded.saturating_sub(first)).ok())
+        .unwrap_or_default()
+}
+
+fn trim_log_cache_to_tail(logs: &mut Vec<LogLine>, limit: usize) {
+    let remove = logs.len().saturating_sub(limit);
+    if remove > 0 {
+        logs.drain(..remove);
+    }
 }
 
 fn merge_log_update(logs: &mut Vec<LogLine>, update: LogUpdate) {
@@ -5889,6 +6725,17 @@ fn merge_log_update(logs: &mut Vec<LogLine>, update: LogUpdate) {
             .into_iter()
             .filter(|line| previous_tail.is_none_or(|sequence| line.sequence > sequence)),
     );
+}
+
+fn merge_paged_logs(logs: &mut Vec<LogLine>, update: LogUpdate) {
+    if let Some(first_sequence) = update.metadata.first_sequence {
+        logs.retain(|line| line.sequence >= first_sequence);
+    } else {
+        logs.clear();
+    }
+    logs.extend(update.lines);
+    logs.sort_unstable_by_key(|line| line.sequence);
+    logs.dedup_by_key(|line| line.sequence);
 }
 
 fn wrapped_log_rows(
@@ -6011,8 +6858,15 @@ fn push_wrapped_character(
 ) {
     let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
     if character_width > 0 && *current_width > 0 && *current_width + character_width > width {
+        let cursor_follows = current.ends_with(FORM_CURSOR_MARKER);
+        if cursor_follows {
+            current.pop();
+        }
         rows.push(std::mem::take(current));
         *current_width = 0;
+        if cursor_follows {
+            current.push(FORM_CURSOR_MARKER);
+        }
     }
     current.push(character);
     *current_width += character_width;
@@ -6036,7 +6890,88 @@ fn copy_to_clipboard(text: String) -> Result<ClipboardLease> {
     Ok(ClipboardLease {
         expires_at: Instant::now() + CLIPBOARD_TTL,
         active,
+        result: None,
     })
+}
+
+fn copy_logs_to_clipboard(
+    runner: &RunnerHandle,
+    id: String,
+    timestamps: bool,
+) -> Result<ClipboardLease> {
+    let runner = runner.background_handle()?;
+    let mut command = Command::new("timeout");
+    command.args([
+        "--signal=TERM",
+        "--kill-after=1",
+        "120",
+        "xclip",
+        "-quiet",
+        "-selection",
+        "clip",
+    ]);
+    spawn_clipboard_log_writer(command, runner, id, timestamps)
+}
+
+fn spawn_clipboard_log_writer(
+    mut command: Command,
+    runner: RunnerHandle,
+    id: String,
+    timestamps: bool,
+) -> Result<ClipboardLease> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start the clipboard helper; xclip and timeout are required")?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("could not open xclip input"))?;
+    let active = Arc::new(AtomicBool::new(true));
+    let result = Arc::new(Mutex::new(None));
+    let writer_active = Arc::clone(&active);
+    let writer_result = Arc::clone(&result);
+    thread::Builder::new()
+        .name("blade-xclip-logs".to_owned())
+        .spawn(move || {
+            let outcome = runner.stream_logs(&id, timestamps, &mut input);
+            let message = match outcome {
+                Ok(export) => export_message("copied", export, None),
+                Err(error) => {
+                    let _ = child.kill();
+                    format!("could not copy output: {error:#}")
+                }
+            };
+            drop(input);
+            if let Ok(mut result) = writer_result.lock() {
+                *result = Some(message);
+            }
+            let _ = child.wait();
+            writer_active.store(false, Ordering::Relaxed);
+        })
+        .context("could not start clipboard log writer")?;
+    Ok(ClipboardLease {
+        expires_at: Instant::now() + CLIPBOARD_TTL,
+        active,
+        result: Some(result),
+    })
+}
+
+fn export_message(action: &str, export: LogExport, path: Option<&Path>) -> String {
+    let destination = path
+        .map(|path| format!(" to {}", path.display()))
+        .unwrap_or_default();
+    let truncated = if export.truncated {
+        " (older lines were evicted during export)"
+    } else {
+        ""
+    };
+    format!(
+        "{action} {} output line(s){destination}{truncated}",
+        export.lines
+    )
 }
 
 fn spawn_clipboard_writer(mut command: Command, text: String) -> Result<Arc<AtomicBool>> {
@@ -6066,25 +7001,6 @@ fn spawn_clipboard_writer(mut command: Command, text: String) -> Result<Arc<Atom
         })
         .context("could not start clipboard writer")?;
     Ok(active)
-}
-
-fn write_dump(path: &PathBuf, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "could not create {}; choose a new path (existing files are never overwritten)",
-                path.display()
-            )
-        })?;
-    file.write_all(text.as_bytes())?;
-    Ok(())
 }
 
 fn safe_filename(name: &str) -> String {
@@ -6153,22 +7069,44 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn content_row(area: Rect, row: u16) -> Option<usize> {
+    let first = area.y.saturating_add(1);
+    let end = area.y.saturating_add(area.height).saturating_sub(1);
+    (row >= first && row < end).then(|| usize::from(row - first))
+}
+
+fn content_contains(area: Rect, column: u16, row: u16) -> bool {
+    column > area.x
+        && column < area.x.saturating_add(area.width).saturating_sub(1)
+        && content_row(area, row).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         path::PathBuf,
         process::Command,
+        sync::atomic::Ordering,
         thread,
         time::{Duration, Instant},
     };
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{
         Terminal,
         backend::TestBackend,
         layout::Rect,
-        style::{Color, Style},
+        style::{Color, Modifier, Style},
     };
     use tempfile::tempdir;
     use unicode_width::UnicodeWidthStr;
@@ -6177,20 +7115,21 @@ mod tests {
         config::{
             RestartAfter, action_id, combine_projects, validate_file, validate_file_with_catalog,
         },
-        log_buffer::{LogBuffer, LogKind},
+        log_buffer::{LogBuffer, LogKind, LogLine},
         project_list::ProjectEntry,
         runner::{CommandState, Runner},
         theme::{Theme, ThemeOverrides},
     };
 
     use super::{
-        App, CommandSelection, ConfirmationAction, Focus, InputMode, ManageActionEditDialog,
-        ManageActionField, ManageEditDialog, ManageEditMode, ManageField, PersistField, RunOutcome,
-        ScratchField, SearchKind, build_search_regex, draw_project_list, footer_shortcuts,
-        form_choice_value, form_text_value, fuzzy_score, help_line, log_cache_matches,
-        merge_log_update, render_vertical_scrollbar, search_needs_top_alignment,
+        App, CommandPicker, CommandSelection, ConfirmationAction, Focus, InputMode,
+        ManageActionEditDialog, ManageActionField, ManageEditDialog, ManageEditMode, ManageField,
+        PersistField, RunOutcome, ScratchField, SearchKind, build_search_regex, draw_project_list,
+        footer_shortcuts, form_choice_value, form_text_value, fuzzy_score, help_line,
+        log_cache_is_current, log_cache_matches, log_cache_offset, log_metadata_for,
+        merge_log_update, push_form_field, render_vertical_scrollbar, spawn_clipboard_log_writer,
         spawn_clipboard_writer, styled_log_line, theme_description, theme_picker_row,
-        wrap_log_text, wrapped_log_view, write_dump,
+        wrap_log_text, wrapped_log_view,
     };
 
     fn wait_until_inactive(app: &App, id: &str) {
@@ -6207,6 +7146,22 @@ mod tests {
         panic!("{id} did not stop in time");
     }
 
+    fn app_logs(app: &App, id: &str) -> Vec<LogLine> {
+        app.runner
+            .log_tail(id, usize::MAX)
+            .map(|update| update.lines)
+            .unwrap_or_default()
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
     fn help_shortcuts_share_the_same_description_column() {
         for key in ["Tab", "↑/↓ or j/k", "PgUp/PgDn, g/G"] {
@@ -6220,13 +7175,92 @@ mod tests {
     }
 
     #[test]
+    fn help_screen_includes_copyright() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let app = App::new(Runner::new(project));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal
+            .draw(|frame| app.draw_help(frame, frame.area()))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("q or Ctrl-C"));
+        assert!(rendered.contains("─ (c) Adnan Hajdarevic <adnanh@gmail.com> ─"));
+    }
+
+    #[test]
     fn form_fields_make_typing_and_choice_controls_visible() {
-        assert_eq!(
-            form_text_value("", true, 0, "command name"),
-            "<command name>█"
+        let style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let mut lines = Vec::new();
+        push_form_field(
+            &mut lines,
+            form_text_value("api", true, 1, "command name"),
+            style,
+            10,
         );
-        assert_eq!(form_text_value("api", true, 3, "command name"), "api█");
-        assert_eq!(form_text_value("api", true, 1, "command name"), "a█pi");
+        let visible = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(visible.trim_end(), "api");
+        let cursor = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .unwrap();
+        assert_eq!(cursor.content.as_ref(), "p");
+
+        let mut end_cursor = Vec::new();
+        push_form_field(
+            &mut end_cursor,
+            form_text_value("api", true, 3, "command name"),
+            style,
+            10,
+        );
+        let cursor = end_cursor[0]
+            .spans
+            .iter()
+            .find(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .unwrap();
+        assert_eq!(cursor.content.as_ref(), " ");
+
+        let mut wrapped_end_cursor = Vec::new();
+        push_form_field(
+            &mut wrapped_end_cursor,
+            form_text_value("api", true, 3, "command name"),
+            style,
+            3,
+        );
+        assert_eq!(wrapped_end_cursor.len(), 3);
+        assert!(
+            wrapped_end_cursor[1]
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+        );
+
         assert_eq!(form_text_value("api", false, 1, "command name"), "api");
         assert_eq!(form_choice_value("Backend", true), "‹ Backend ›");
         assert_eq!(form_choice_value("Backend", false), "Backend");
@@ -6376,7 +7410,9 @@ run = "echo {name}"
 
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
-            .draw(|frame| app.draw_commands(frame, Rect::new(0, 0, 40, 8)))
+            .draw(|frame| {
+                app.draw_commands(frame, Rect::new(0, 0, 40, 8));
+            })
             .unwrap();
         let rendered = terminal
             .backend()
@@ -6387,6 +7423,194 @@ run = "echo {name}"
             .collect::<String>();
         assert!(rendered.contains("First"));
         assert!(rendered.contains("Second"));
+    }
+
+    #[test]
+    fn mouse_clicks_and_scroll_select_commands_in_the_visible_tree() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "first"
+run = "true"
+[[groups.commands]]
+name = "second"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.focus = Focus::Logs;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let layout = app.mouse_layout.clone().unwrap();
+        let second = app
+            .command_items
+            .iter()
+            .position(|selection| {
+                matches!(
+                    selection,
+                    CommandSelection::Command {
+                        group: 0,
+                        command: 1
+                    }
+                )
+            })
+            .unwrap();
+        let row = layout.commands.y + 1 + u16::try_from(second - layout.command_offset).unwrap();
+        app.handle_mouse(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.commands.x + 1,
+            row,
+        ));
+
+        assert_eq!(app.focus, Focus::Commands);
+        assert_eq!(app.selected_command_name(), Some("second"));
+
+        app.handle_mouse(mouse_event(
+            MouseEventKind::ScrollUp,
+            layout.commands.x + 1,
+            row,
+        ));
+        assert_eq!(app.selected_command_name(), Some("first"));
+    }
+
+    #[test]
+    fn mouse_click_selects_the_visible_wrapped_log_line() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "printf 'first\nsecond\nthird\n'"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.runner.start("command").unwrap();
+        wait_until_inactive(&app, "command");
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let target = app
+            .log_cache
+            .iter()
+            .position(|line| line.text == "first")
+            .unwrap();
+        let layout = app.mouse_layout.clone().unwrap();
+        let visible_row = layout
+            .log_rows
+            .iter()
+            .position(|index| *index == Some(target))
+            .unwrap();
+        app.handle_mouse(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.logs.x + 1,
+            layout.logs.y + 1 + u16::try_from(visible_row).unwrap(),
+        ));
+
+        assert_eq!(app.focus, Focus::Logs);
+        assert_eq!(app.log_cursor, target);
+        assert!(!app.follow);
+    }
+
+    #[test]
+    fn tree_shortcuts_collapse_selected_nodes_and_the_whole_tree() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "Frontend"
+[[groups.commands]]
+name = "dashboard"
+run = "true"
+[[groups.commands.actions]]
+name = "install"
+run = "true"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+
+        assert_eq!(app.command_items.len(), 3);
+        assert!(matches!(
+            app.command_items[app.selected_item],
+            CommandSelection::Command { .. }
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.command_items.len(), 2);
+        assert!(
+            !app.command_items
+                .iter()
+                .any(|item| matches!(item, CommandSelection::Action { .. }))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.command_items.len(), 3);
+        app.selected_item = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.command_items, [CommandSelection::Group(0)]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.command_items.len(), 3);
+        app.handle_key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.command_items, [CommandSelection::Group(0)]);
+    }
+
+    #[test]
+    fn a_collapsed_project_hides_its_groups_without_hiding_other_projects() {
+        let directory = tempdir().unwrap();
+        let mut loaded = Vec::new();
+        for name in ["First", "Second"] {
+            let path = directory.path().join(format!("{name}.blade"));
+            fs::write(
+                &path,
+                format!(
+                    r#"
+shell = "/bin/sh"
+[[groups]]
+name = "Backend"
+[[groups.commands]]
+name = "server"
+run = "echo {name}"
+"#
+                ),
+            )
+            .unwrap();
+            loaded.push((name.to_owned(), validate_file(&path).project.unwrap()));
+        }
+        let project = combine_projects(directory.path().join("projects.config"), loaded).unwrap();
+        let mut app = App::new(Runner::new(project));
+
+        app.selected_item = 0;
+        app.set_selected_tree_expanded(false);
+        assert!(!app.command_items.contains(&CommandSelection::Group(0)));
+        assert!(app.command_items.contains(&CommandSelection::Group(1)));
+
+        app.set_selected_tree_expanded(true);
+        assert!(app.command_items.contains(&CommandSelection::Group(0)));
     }
 
     #[test]
@@ -6421,8 +7645,7 @@ run = "true"
             Some(CommandSelection::Ephemeral(0))
         ));
         assert!(
-            app.runner
-                .logs(&id)
+            app_logs(&app, &id)
                 .iter()
                 .any(|line| line.text == "EPHEMERAL_TUI_READY")
         );
@@ -6504,7 +7727,7 @@ run = "true"
         assert!(scratch.log_rotate_bytes.is_none());
         wait_until_inactive(&app, &id);
 
-        assert!(app.runner.logs(&id).iter().any(|line| {
+        assert!(app_logs(&app, &id).iter().any(|line| {
             line.text
                 == format!(
                     "cwd={} setup=setup pre=scratch",
@@ -6527,7 +7750,7 @@ run = "true"
         assert_eq!(app.ephemeral[0].config.id, id);
         assert_eq!(app.ephemeral[0].config.name, "Renamed server");
         assert_eq!(app.ephemeral[0].config.run, "echo EDITED_IN_PLACE");
-        let logs = app.runner.logs(&id);
+        let logs = app_logs(&app, &id);
         assert!(logs.iter().any(|line| line.text == "EDITED_IN_PLACE"));
         assert!(logs.iter().any(|line| {
             line.text
@@ -6542,8 +7765,9 @@ run = "true"
             .iter()
             .position(|item| matches!(item, CommandSelection::EphemeralAction { .. }))
             .unwrap();
+        let action_selection = app.command_items[action_item];
         assert_eq!(
-            app.command_picker_label(action_item).as_deref(),
+            app.command_picker_label(action_selection).as_deref(),
             Some("Ephemeral / Renamed server › inspect")
         );
         app.selected_item = action_item;
@@ -6567,7 +7791,7 @@ run = "true"
         assert_eq!(action.name, "inspect scratch");
         assert_eq!(action.cwd, directory.path().join("scratch"));
         assert_eq!(action.pre, ["export ACTION_PRE=edited"]);
-        assert!(app.runner.logs(&action_id).iter().any(|line| {
+        assert!(app_logs(&app, &action_id).iter().any(|line| {
             line.text
                 == format!(
                     "action-cwd={} pre=edited",
@@ -6655,12 +7879,28 @@ run = "echo installed"
             .iter()
             .position(|item| matches!(item, CommandSelection::Action { .. }))
             .unwrap();
+        let action_selection = app.command_items[action_item];
 
         assert_eq!(
-            app.command_picker_label(action_item).as_deref(),
+            app.command_picker_label(action_selection).as_deref(),
             Some("Frontend / Dashboard › Install dependencies")
         );
-        assert_eq!(app.command_matches("install")[0].item_index, action_item);
+        assert_eq!(
+            app.command_matches("install")[0].selection,
+            action_selection
+        );
+        app.collapse_all_tree_nodes();
+        assert!(!app.command_items.contains(&action_selection));
+        app.command_picker = Some(CommandPicker {
+            query: "install".to_owned(),
+            selected: 0,
+        });
+        app.handle_command_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.command_items[app.selected_item], action_selection);
+        assert!(!app.collapsed.groups.contains(&(
+            app.groups[0].project_file.clone(),
+            app.groups[0].name.clone()
+        )));
         app.selected_item = action_item;
         assert_eq!(
             app.selected_targets(),
@@ -6672,8 +7912,7 @@ run = "echo installed"
         app.start_selected();
         wait_until_inactive(&app, &action_id);
         assert!(
-            app.runner
-                .logs(&action_id)
+            app_logs(&app, &action_id)
                 .iter()
                 .any(|line| line.text == "installed")
         );
@@ -6781,8 +8020,7 @@ run = "true"
         );
         assert!(app.ephemeral.is_empty());
         assert!(
-            app.runner
-                .logs(&id)
+            app_logs(&app, &id)
                 .iter()
                 .any(|line| line.text == "KEEP_THIS_OUTPUT")
         );
@@ -6975,16 +8213,24 @@ run = {run:?}
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("COMMAND_END█"));
+        assert!(rendered.contains("COMMAND_END"));
         let buffer = terminal.backend().buffer();
         let cursor_row = (0..30)
             .find(|y| {
                 (0..70)
                     .map(|x| buffer[(x, *y)].symbol())
                     .collect::<String>()
-                    .contains("COMMAND_END█")
+                    .contains("COMMAND_END")
             })
             .unwrap();
+        let cursor_column = (0..70)
+            .find(|x| {
+                buffer[(*x, cursor_row)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .unwrap();
+        assert_eq!(buffer[(cursor_column, cursor_row)].symbol(), " ");
         for x in 4..66 {
             assert_eq!(
                 buffer[(x, cursor_row)].bg,
@@ -7243,7 +8489,9 @@ run = "true"
         let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
 
         terminal
-            .draw(|frame| app.draw_commands(frame, Rect::new(0, 0, 20, 4)))
+            .draw(|frame| {
+                app.draw_commands(frame, Rect::new(0, 0, 20, 4));
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -7254,7 +8502,9 @@ run = "true"
 
         app.selected_item = 0;
         terminal
-            .draw(|frame| app.draw_commands(frame, Rect::new(0, 0, 20, 4)))
+            .draw(|frame| {
+                app.draw_commands(frame, Rect::new(0, 0, 20, 4));
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         for x in 1..19 {
@@ -7604,7 +8854,7 @@ run = "echo clear-me"
         let mut app = App::new(Runner::new(project));
         app.start_selected();
         wait_until_inactive(&app, "command");
-        assert!(!app.runner.logs("command").is_empty());
+        assert!(!app_logs(&app, "command").is_empty());
         app.apply_search("clear-me".to_owned(), SearchKind::Exact);
         app.log_scroll = 1;
         app.horizontal_scroll = 4;
@@ -7612,7 +8862,7 @@ run = "echo clear-me"
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
             .unwrap();
 
-        assert!(app.runner.logs("command").is_empty());
+        assert!(app_logs(&app, "command").is_empty());
         assert!(app.search.is_none());
         assert!(app.follow);
         assert_eq!(app.log_cursor, 0);
@@ -7769,6 +9019,55 @@ run = "true"
     }
 
     #[test]
+    fn search_finds_unloaded_history_without_loading_the_whole_log() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+max_log_lines = 2000
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "printf 'EARLY_%s\\n' NEEDLE; seq 1 900"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.runner.start("command").unwrap();
+        wait_until_inactive(&app, "command");
+        app.refresh_runtime_snapshots();
+        let snapshot = app.runtime_snapshots.get("command").cloned().unwrap();
+        app.refresh_log_cache(Some("command"), Some(&snapshot));
+        assert!(!app.log_cache.iter().any(|line| line.text == "EARLY_NEEDLE"));
+        app.log_cursor = app.log_cache.len() - 1;
+        app.log_view_height = 7;
+
+        app.apply_search("EARLY_NEEDLE".to_owned(), SearchKind::Exact);
+
+        assert_eq!(app.log_cache[app.log_cursor].text, "EARLY_NEEDLE");
+        assert!(app.log_cache.len() <= super::LOG_PAGE_LINES);
+        assert!(!app.log_cache_complete);
+        assert!(!app.follow);
+
+        let match_index = app.log_cursor;
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.draw_logs(frame, frame.area());
+            })
+            .unwrap();
+        assert!(
+            app.visible_log_range
+                .is_some_and(|(_, last)| last > match_index),
+            "search results should retain visible context after the match"
+        );
+    }
+
+    #[test]
     fn fuzzy_command_score_matches_ordered_abbreviations() {
         assert!(fuzzy_score("acme-dashboard", "adash").is_some());
         assert!(fuzzy_score("site-manager", "smgr").is_some());
@@ -7822,15 +9121,6 @@ run = "true"
     }
 
     #[test]
-    fn search_only_repositions_an_offscreen_wrapped_match() {
-        assert!(!search_needs_top_alignment(true, Some((4, 8)), 6));
-        assert!(search_needs_top_alignment(true, Some((4, 8)), 2));
-        assert!(!search_needs_top_alignment(true, Some((4, 8)), 10));
-        assert!(!search_needs_top_alignment(true, None, 10));
-        assert!(!search_needs_top_alignment(false, Some((4, 8)), 2));
-    }
-
-    #[test]
     fn final_wrapped_search_match_is_bottom_aligned() {
         let mut buffer = LogBuffer::new(10);
         for line in ["zero", "one", "two", "three", "final match"] {
@@ -7839,7 +9129,6 @@ run = "true"
         let logs = buffer.snapshot();
         let mut end = 2;
 
-        assert!(!search_needs_top_alignment(true, Some((0, 2)), 4));
         let rows = wrapped_log_view(&logs, 4, &mut end, 3, 20, false);
 
         assert_eq!(
@@ -7884,14 +9173,14 @@ run = "true"
         let second = buffer.push(LogKind::Output, "two");
         let mut cache = Vec::new();
 
-        let initial = buffer.update_since(None);
+        let initial = buffer.update_since_limited(None, usize::MAX);
         let initial_metadata = initial.metadata;
         merge_log_update(&mut cache, initial);
         assert!(log_cache_matches(&cache, initial_metadata));
 
         buffer.push(LogKind::Output, "three");
         buffer.push(LogKind::Output, "four");
-        let update = buffer.update_since(Some(second.sequence));
+        let update = buffer.update_since_limited(Some(second.sequence), usize::MAX);
         let update_metadata = update.metadata;
         merge_log_update(&mut cache, update);
 
@@ -7903,6 +9192,58 @@ run = "true"
                 .collect::<Vec<_>>(),
             ["two", "three", "four"]
         );
+    }
+
+    #[test]
+    fn follow_mode_pages_history_without_promoting_the_whole_log() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(".blade");
+        fs::write(
+            &path,
+            r#"
+shell = "/bin/sh"
+max_log_lines = 2000
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "for i in $(seq 1 900); do echo $i; done"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&path).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.runner.start("command").unwrap();
+        wait_until_inactive(&app, "command");
+        app.refresh_runtime_snapshots();
+        let snapshot = app.runtime_snapshots.get("command").cloned().unwrap();
+
+        app.refresh_log_cache(Some("command"), Some(&snapshot));
+
+        let metadata = app.log_cache_metadata.unwrap();
+        assert_eq!(app.log_cache.len(), super::LOG_PAGE_LINES);
+        assert!(metadata.count > app.log_cache.len());
+        assert!(log_cache_is_current(&app.log_cache, metadata));
+        assert!(!log_cache_matches(&app.log_cache, metadata));
+        assert_eq!(
+            log_cache_offset(&app.log_cache, metadata) + app.log_cache.len(),
+            metadata.count
+        );
+
+        app.log_cursor = app.log_cache.len() - 1;
+        app.move_log_cursor(-1);
+        assert_eq!(app.log_cursor, app.log_cache.len() - 2);
+        assert!(!app.follow);
+        assert_eq!(app.log_cache.len(), super::LOG_PAGE_LINES);
+
+        app.move_log_cursor(-254);
+        assert_eq!(app.log_cache.len(), super::LOG_PAGE_LINES * 2);
+        assert!(!app.log_cache_complete);
+
+        app.load_first_selected_log_page();
+        assert_eq!(app.log_cache.len(), super::LOG_PAGE_LINES);
+        assert_eq!(log_cache_offset(&app.log_cache, metadata), 0);
+        assert_eq!(app.log_cursor, 0);
     }
 
     #[test]
@@ -7929,6 +9270,8 @@ run = "true"
         }
         app.log_cache_name = Some("command".to_owned());
         app.log_cache = buffer.snapshot();
+        app.log_cache_metadata = Some(log_metadata_for(&app.log_cache));
+        app.log_cache_complete = true;
         app.log_cursor = 1;
         app.follow = false;
 
@@ -7992,10 +9335,44 @@ run = "true"
     #[test]
     fn dump_never_overwrites_an_existing_file() {
         let directory = tempdir().unwrap();
+        let config = directory.path().join(".blade");
+        fs::write(
+            &config,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "echo first"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&config).project.unwrap();
+        let mut app = App::new(Runner::new(project));
+        app.runner.start("command").unwrap();
+        wait_until_inactive(&app, "command");
         let path = directory.path().join("output.log");
-        write_dump(&path, "first").unwrap();
-        assert!(write_dump(&path, "second").is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "first");
+        app.runner.dump_logs("command", &path, false).unwrap();
+        assert!(app.runner.dump_logs("command", &path, false).is_err());
+        assert!(std::fs::read_to_string(path).unwrap().contains("first"));
+
+        let background_path = directory.path().join("background.log");
+        app.dump_logs(background_path.clone());
+        while app
+            .dump_task
+            .as_ref()
+            .is_some_and(|task| task.active.load(Ordering::Relaxed))
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        app.refresh_dump_task();
+        assert!(
+            std::fs::read_to_string(background_path)
+                .unwrap()
+                .contains("first")
+        );
+        assert!(app.message.starts_with("dumped "));
     }
 
     #[test]
@@ -8005,6 +9382,58 @@ run = "true"
         let started = Instant::now();
         spawn_clipboard_writer(command, "output".to_owned()).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn copy_all_streams_pages_into_the_clipboard_writer() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join(".blade");
+        fs::write(
+            &config,
+            r#"
+shell = "/bin/sh"
+[[groups]]
+name = "all"
+[[groups.commands]]
+name = "command"
+run = "echo streamed-output; seq 1 700"
+"#,
+        )
+        .unwrap();
+        let project = validate_file(&config).project.unwrap();
+        let app = App::new(Runner::new(project));
+        app.runner.start("command").unwrap();
+        wait_until_inactive(&app, "command");
+        let output = directory.path().join("clipboard.txt");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &format!("cat > {}", output.display())]);
+        let lease = spawn_clipboard_log_writer(
+            command,
+            app.runner.background_handle().unwrap(),
+            "command".to_owned(),
+            false,
+        )
+        .unwrap();
+        while lease.active.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            std::fs::read_to_string(output)
+                .unwrap()
+                .contains("streamed-output")
+        );
+        assert!(
+            lease
+                .result
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .starts_with("copied ")
+        );
     }
 
     #[test]

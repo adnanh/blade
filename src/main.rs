@@ -16,6 +16,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use crate::{
     config::{
@@ -26,7 +27,8 @@ use crate::{
         GlobalSettings, GlobalTheme, ProjectEntry, candidate_paths, find_file as find_project_list,
         home_directory,
     },
-    supervisor::{RunnerHandle, SessionProject, SessionSource},
+    runner::CommandStatus,
+    supervisor::{RunnerHandle, SessionDescriptor, SessionProject, SessionSource},
     theme::{ThemeCatalog, ThemeOverrides},
     tui::{RunOutcome, StartupMode},
 };
@@ -90,11 +92,27 @@ enum Action {
         #[command(flatten)]
         startup: StartupOptions,
     },
+    /// List running Blade sessions.
+    Sessions {
+        /// Emit session details as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach to a detached Blade session.
     Attach {
         /// Session id or project name. Omit when exactly one session exists.
         #[arg(value_name = "SESSION")]
         session: Option<String>,
+    },
+    /// Shut down a running Blade session without opening the TUI.
+    Shutdown {
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+
+        /// Immediately kill all process groups instead of stopping them gracefully.
+        #[arg(long)]
+        force: bool,
     },
     /// Interactively create a .blade project file.
     Init {
@@ -112,7 +130,7 @@ enum Action {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
-    /// Manage project commands or register the project globally.
+    /// Manage configuration or control commands in a running session.
     Command {
         #[command(subcommand)]
         action: CommandAction,
@@ -126,11 +144,75 @@ enum Action {
 
 #[derive(Debug, Subcommand)]
 enum CommandAction {
-    /// Display a project or global configuration in a readable format.
+    /// Display project configuration or commands in a running session.
     List {
         /// Project alias to show when targeting a global project list.
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
+
+        /// List commands in a running session. Omit the value when only one session exists.
+        #[arg(
+            long,
+            value_name = "SESSION",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "project"
+        )]
+        session: Option<String>,
+
+        /// Emit the live session list as JSON.
+        #[arg(long, requires = "session")]
+        json: bool,
+    },
+    /// Start a command in a running session.
+    Start {
+        /// Command name, selector, or id from `blade command list --session`.
+        #[arg(value_name = "COMMAND")]
+        name: String,
+
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Gracefully stop a command with SIGINT and normal timeout escalation.
+    Stop {
+        /// Command name, selector, or id from `blade command list --session`.
+        #[arg(value_name = "COMMAND")]
+        name: String,
+
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Restart a command in a running session.
+    Restart {
+        /// Command name, selector, or id from `blade command list --session`.
+        #[arg(value_name = "COMMAND")]
+        name: String,
+
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Terminate a command with SIGTERM and kill it after its stop timeout.
+    Terminate {
+        /// Command name, selector, or id from `blade command list --session`.
+        #[arg(value_name = "COMMAND")]
+        name: String,
+
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Immediately kill a command with SIGKILL.
+    Kill {
+        /// Command name, selector, or id from `blade command list --session`.
+        #[arg(value_name = "COMMAND")]
+        name: String,
+
+        /// Session id or project name. Omit when exactly one session exists.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
     },
     /// Append a command, creating the group when needed.
     Add {
@@ -263,11 +345,33 @@ fn execute(cli: Cli) -> Result<u8> {
         bail!("--all, --no-autostart, and --global may only be used when running Blade");
     }
     match action {
+        Action::Sessions { json } => {
+            if cli.file.is_some() {
+                bail!("--file cannot be used when listing running sessions");
+            }
+            list_sessions(json)?;
+            Ok(0)
+        }
         Action::Attach { session } => {
             let descriptor = supervisor::find_descriptor(session.as_deref())?;
             let project = load_session_project(&descriptor.source)?;
             let runner = supervisor::connect_existing(project, descriptor)?;
             run_tui_session(runner, StartupMode::None)?;
+            Ok(0)
+        }
+        Action::Shutdown { session, force } => {
+            if cli.file.is_some() {
+                bail!("--file cannot be used with session shutdown; select it by name or id");
+            }
+            let descriptor = supervisor::find_descriptor(session.as_deref())?;
+            let name = descriptor.name.clone();
+            let project = load_session_project(&descriptor.source)?;
+            let runner = supervisor::connect_existing(project, descriptor)?;
+            runner.shutdown_session(force)?;
+            println!(
+                "{} shutdown requested for {name}",
+                if force { "forced" } else { "graceful" }
+            );
             Ok(0)
         }
         Action::Supervisor { session_file } => {
@@ -319,9 +423,40 @@ fn execute(cli: Cli) -> Result<u8> {
         }
         Action::Command { action } => {
             match action {
-                CommandAction::List { project } => {
-                    let path = command_source_path(cli.file)?;
-                    command_edit::list(&path, project.as_deref())?;
+                CommandAction::List {
+                    project,
+                    session,
+                    json,
+                } => {
+                    if let Some(session) = session {
+                        if cli.file.is_some() {
+                            bail!("--file cannot be combined with --session");
+                        }
+                        list_live_commands(non_empty_session(&session), json)?;
+                    } else {
+                        let path = command_source_path(cli.file)?;
+                        command_edit::list(&path, project.as_deref())?;
+                    }
+                }
+                CommandAction::Start { name, session } => {
+                    ensure_live_command_has_no_file(cli.file.as_deref())?;
+                    run_live_command(&name, session.as_deref(), LiveCommandOperation::Start)?;
+                }
+                CommandAction::Stop { name, session } => {
+                    ensure_live_command_has_no_file(cli.file.as_deref())?;
+                    run_live_command(&name, session.as_deref(), LiveCommandOperation::Stop)?;
+                }
+                CommandAction::Restart { name, session } => {
+                    ensure_live_command_has_no_file(cli.file.as_deref())?;
+                    run_live_command(&name, session.as_deref(), LiveCommandOperation::Restart)?;
+                }
+                CommandAction::Terminate { name, session } => {
+                    ensure_live_command_has_no_file(cli.file.as_deref())?;
+                    run_live_command(&name, session.as_deref(), LiveCommandOperation::Terminate)?;
+                }
+                CommandAction::Kill { name, session } => {
+                    ensure_live_command_has_no_file(cli.file.as_deref())?;
+                    run_live_command(&name, session.as_deref(), LiveCommandOperation::Kill)?;
                 }
                 CommandAction::Add {
                     name,
@@ -489,6 +624,279 @@ fn load_session_project(source: &SessionSource) -> Result<ProjectConfig> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct SessionView {
+    id: String,
+    name: String,
+    protocol: u32,
+    kind: &'static str,
+    source: PathBuf,
+    projects: Vec<SessionProject>,
+}
+
+impl From<SessionDescriptor> for SessionView {
+    fn from(descriptor: SessionDescriptor) -> Self {
+        let (kind, source, projects) = match descriptor.source {
+            SessionSource::Project { path } => ("project", path, Vec::new()),
+            SessionSource::Combined {
+                project_list,
+                projects,
+            } => ("combined", project_list, projects),
+        };
+        Self {
+            id: descriptor.id,
+            name: descriptor.name,
+            protocol: descriptor.protocol,
+            kind,
+            source,
+            projects,
+        }
+    }
+}
+
+fn list_sessions(json: bool) -> Result<()> {
+    let sessions = supervisor::list_descriptors()?
+        .into_iter()
+        .map(SessionView::from)
+        .collect::<Vec<_>>();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&sessions).context("could not encode Blade sessions")?
+        );
+        return Ok(());
+    }
+    if sessions.is_empty() {
+        println!("No running Blade sessions.");
+        return Ok(());
+    }
+
+    let id_width = sessions
+        .iter()
+        .map(|session| session.id.len())
+        .max()
+        .unwrap_or(2)
+        .max(2);
+    let name_width = sessions
+        .iter()
+        .map(|session| session.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!(
+        "{:<id_width$}  {:<name_width$}  {:<8}  {:<8}  SOURCE",
+        "ID", "NAME", "PROTOCOL", "KIND"
+    );
+    for session in sessions {
+        println!(
+            "{:<id_width$}  {:<name_width$}  {:<8}  {:<8}  {}",
+            session.id,
+            session.name,
+            session.protocol,
+            session.kind,
+            session.source.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveCommandView {
+    selector: String,
+    id: String,
+    name: String,
+    project: Option<String>,
+    group: Option<String>,
+    ephemeral: bool,
+    state: String,
+    pid: Option<i32>,
+    exit_code: Option<i32>,
+    stop_level: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LiveCommandOperation {
+    Start,
+    Stop,
+    Restart,
+    Terminate,
+    Kill,
+}
+
+impl LiveCommandOperation {
+    fn apply(self, runner: &RunnerHandle, id: &str) -> Result<()> {
+        match self {
+            Self::Start => runner.start(id),
+            Self::Stop => runner.stop(id),
+            Self::Restart => runner.restart(id),
+            Self::Terminate => runner.terminate(id),
+            Self::Kill => runner.kill(id),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Terminate => "termination",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+fn non_empty_session(session: &str) -> Option<&str> {
+    (!session.is_empty()).then_some(session)
+}
+
+fn ensure_live_command_has_no_file(file: Option<&Path>) -> Result<()> {
+    if file.is_some() {
+        bail!("--file cannot be used with live command operations; use --session instead");
+    }
+    Ok(())
+}
+
+fn connect_live_session(session: Option<&str>) -> Result<RunnerHandle> {
+    let descriptor = supervisor::find_descriptor(session)?;
+    let project = load_session_project(&descriptor.source)?;
+    supervisor::connect_existing(project, descriptor)
+}
+
+fn live_command_views(runner: &RunnerHandle, statuses: Vec<CommandStatus>) -> Vec<LiveCommandView> {
+    let ephemerals = runner.ephemeral_commands();
+    let mut commands = statuses
+        .into_iter()
+        .map(|status| {
+            let configured = runner.project().groups.iter().find_map(|group| {
+                group
+                    .commands
+                    .iter()
+                    .any(|command| command.id == status.id)
+                    .then(|| (group.project.clone(), Some(group.name.clone()), false))
+            });
+            let location = configured.or_else(|| {
+                ephemerals
+                    .iter()
+                    .find(|ephemeral| ephemeral.config.id == status.id)
+                    .map(|ephemeral| {
+                        (
+                            ephemeral.project.clone(),
+                            Some(ephemeral.suggested_group.clone()),
+                            true,
+                        )
+                    })
+            });
+            let (project, group, ephemeral) = location.unwrap_or((None, None, false));
+            let selector = project
+                .as_ref()
+                .map(|project| format!("{project}::{}", status.name))
+                .unwrap_or_else(|| status.name.clone());
+            LiveCommandView {
+                selector,
+                id: status.id,
+                name: status.name,
+                project,
+                group,
+                ephemeral,
+                state: status.state.label().to_owned(),
+                pid: status.pid,
+                exit_code: status.exit_code,
+                stop_level: status.stop_level,
+            }
+        })
+        .collect::<Vec<_>>();
+    commands.sort_by(|left, right| {
+        left.selector
+            .cmp(&right.selector)
+            .then(left.id.cmp(&right.id))
+    });
+    commands
+}
+
+fn list_live_commands(session: Option<&str>, json: bool) -> Result<()> {
+    let runner = connect_live_session(session)?;
+    let commands = live_command_views(&runner, runner.command_statuses()?);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&commands)
+                .context("could not encode live command status")?
+        );
+        return Ok(());
+    }
+
+    let selector_width = commands
+        .iter()
+        .map(|command| command.selector.len())
+        .max()
+        .unwrap_or("COMMAND".len())
+        .max("COMMAND".len());
+    println!(
+        "{:<10}  {:<selector_width$}  {:>7}  {:>5}  ID",
+        "STATE", "COMMAND", "PID", "EXIT"
+    );
+    for command in commands {
+        let pid = command.pid.map(|pid| pid.to_string()).unwrap_or_default();
+        let exit = command
+            .exit_code
+            .map(|exit| exit.to_string())
+            .unwrap_or_default();
+        println!(
+            "{:<10}  {:<selector_width$}  {:>7}  {:>5}  {}",
+            command.state, command.selector, pid, exit, command.id
+        );
+    }
+    Ok(())
+}
+
+fn resolve_live_command<'a>(
+    commands: &'a [LiveCommandView],
+    target: &str,
+) -> Result<&'a LiveCommandView> {
+    if let Some(command) = commands.iter().find(|command| command.id == target) {
+        return Ok(command);
+    }
+    let matches = commands
+        .iter()
+        .filter(|command| command.selector == target || command.name == target)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => bail!(
+            "unknown live command {target:?}; use `blade command list --session` to list selectors"
+        ),
+        [command] => Ok(*command),
+        _ => {
+            let choices = matches
+                .iter()
+                .map(|command| format!("{} ({})", command.selector, command.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("command name {target:?} is ambiguous; choose one of: {choices}")
+        }
+    }
+}
+
+fn run_live_command(
+    target: &str,
+    session: Option<&str>,
+    operation: LiveCommandOperation,
+) -> Result<()> {
+    let runner = connect_live_session(session)?;
+    let commands = live_command_views(&runner, runner.command_statuses()?);
+    let command = resolve_live_command(&commands, target)?;
+    operation.apply(&runner, &command.id)?;
+    let state = runner
+        .snapshot(&command.id)
+        .map(|snapshot| snapshot.state.label())
+        .unwrap_or("unknown");
+    println!(
+        "{} requested: {} [{state}]",
+        operation.label(),
+        command.selector
+    );
+    Ok(())
+}
+
 fn run_tui_session(runner: RunnerHandle, startup: StartupMode) -> Result<()> {
     let mut startup = startup;
     let mut message = None;
@@ -499,6 +907,7 @@ fn run_tui_session(runner: RunnerHandle, startup: StartupMode) -> Result<()> {
                 return Ok(());
             }
             RunOutcome::Detached => return Ok(()),
+            RunOutcome::SessionEnded => return Ok(()),
             RunOutcome::Reload => {
                 let session = runner
                     .session_id()
@@ -872,14 +1281,17 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        config::validate_file,
+        config::{combine_projects, validate_file},
         project_list::GlobalTheme,
+        runner::Runner,
+        supervisor::RunnerHandle,
         theme::{Theme, ThemeOverrides},
     };
 
     use super::{
         Action, Cli, CommandAction, StartupOptions, apply_global_theme, command_project_path,
-        execute, find_local_project_file, validate_project_list,
+        execute, find_local_project_file, live_command_views, resolve_live_command,
+        validate_project_list,
     };
 
     #[test]
@@ -914,6 +1326,42 @@ mod tests {
     }
 
     #[test]
+    fn sessions_supports_text_and_json_listing() {
+        let text = Cli::try_parse_from(["blade", "sessions"]).unwrap();
+        assert!(matches!(
+            text.command,
+            Some(Action::Sessions { json: false })
+        ));
+
+        let json = Cli::try_parse_from(["blade", "sessions", "--json"]).unwrap();
+        assert!(matches!(
+            json.command,
+            Some(Action::Sessions { json: true })
+        ));
+    }
+
+    #[test]
+    fn shutdown_accepts_an_optional_session_and_force_flag() {
+        let graceful = Cli::try_parse_from(["blade", "shutdown"]).unwrap();
+        assert!(matches!(
+            graceful.command,
+            Some(Action::Shutdown {
+                session: None,
+                force: false
+            })
+        ));
+
+        let forced = Cli::try_parse_from(["blade", "shutdown", "abc123", "--force"]).unwrap();
+        assert!(matches!(
+            forced.command,
+            Some(Action::Shutdown {
+                session: Some(session),
+                force: true
+            }) if session == "abc123"
+        ));
+    }
+
+    #[test]
     fn all_and_no_autostart_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["blade", "--all", "--no-autostart"]).is_err());
     }
@@ -944,6 +1392,89 @@ mod tests {
         assert!(!help.contains("--all"));
         assert!(!help.contains("--no-autostart"));
         assert!(!help.contains("--global"));
+    }
+
+    #[test]
+    fn parses_live_command_operations_and_session_listing() {
+        let implicit_list =
+            Cli::try_parse_from(["blade", "command", "list", "--session", "--json"]).unwrap();
+        assert!(matches!(
+            implicit_list.command,
+            Some(Action::Command {
+                action: CommandAction::List {
+                    session: Some(session),
+                    json: true,
+                    ..
+                }
+            }) if session.is_empty()
+        ));
+
+        let explicit_list =
+            Cli::try_parse_from(["blade", "command", "list", "--session", "blade-dev"]).unwrap();
+        assert!(matches!(
+            explicit_list.command,
+            Some(Action::Command {
+                action: CommandAction::List {
+                    session: Some(session),
+                    json: false,
+                    ..
+                }
+            }) if session == "blade-dev"
+        ));
+
+        for operation in ["start", "stop", "restart", "terminate", "kill"] {
+            let command = Cli::try_parse_from([
+                "blade",
+                "command",
+                operation,
+                "Backend::api",
+                "--session",
+                "abc123",
+            ])
+            .unwrap();
+            assert!(matches!(command.command, Some(Action::Command { .. })));
+        }
+    }
+
+    #[test]
+    fn live_command_selectors_disambiguate_combined_projects() {
+        let directory = tempdir().unwrap();
+        let mut projects = Vec::new();
+        for name in ["First", "Second"] {
+            let path = directory.path().join(format!("{name}.blade"));
+            fs::write(
+                &path,
+                format!(
+                    r#"
+name = "{name}"
+shell = "/bin/sh"
+[[groups]]
+name = "Backend"
+[[groups.commands]]
+name = "api"
+run = "true"
+"#
+                ),
+            )
+            .unwrap();
+            projects.push((name.to_owned(), validate_file(&path).project.unwrap()));
+        }
+        let combined = combine_projects(directory.path().join("blade.conf"), projects).unwrap();
+        let runner = RunnerHandle::from(Runner::new(combined));
+        let commands = live_command_views(&runner, runner.command_statuses().unwrap());
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.selector.as_str())
+                .collect::<Vec<_>>(),
+            ["First::api", "Second::api"]
+        );
+        assert!(resolve_live_command(&commands, "api").is_err());
+        assert_eq!(
+            resolve_live_command(&commands, "Second::api").unwrap().id,
+            "1::api"
+        );
     }
 
     #[test]
@@ -1023,7 +1554,8 @@ mod tests {
             list.command,
             Some(Action::Command {
                 action: CommandAction::List {
-                    project: Some(project)
+                    project: Some(project),
+                    ..
                 }
             }) if project == "ACME Development"
         ));
